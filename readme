@@ -1,0 +1,46 @@
+## Run MedShare AI in VS Code
+
+### First-time setup
+
+**Backend terminal** — run once:
+
+```powershell
+cd D:\newMed\backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+Generate your JWT secret **once**:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Copy the output into `backend/.env` as `JWT_SECRET=...`. Configure your database and Gemini API key there too. Keep this file private.
+
+### Every time you run the project
+
+**Terminal 1 — Backend**
+
+```powershell
+cd D:\newMed\backend
+.\.venv\Scripts\Activate.ps1
+alembic upgrade head
+uvicorn app.main:app --reload
+```
+
+**Terminal 2 — Frontend**
+
+```powershell
+cd D:\newMed\frontend
+npm run dev
+```
+
+Open `http://localhost:5173`.
+
+The JWT secret is saved in `.env`; do not regenerate it every time.
+
+reviewer@example.com
+FrogGoesMooo7

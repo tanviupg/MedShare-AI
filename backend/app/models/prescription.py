@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Uuid, func
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -24,6 +24,11 @@ class Prescription(Base):
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    extracted_medicine_name: Mapped[str | None] = mapped_column(String(200))
+    extracted_strength: Mapped[str | None] = mapped_column(String(100))
+    extracted_dosage_form: Mapped[str | None] = mapped_column(String(100))
+    extraction_confidence: Mapped[float | None] = mapped_column(Float)
+    medicine_match: Mapped[str] = mapped_column(String(10), nullable=False, default="UNCERTAIN", server_default="UNCERTAIN")
     status: Mapped[PrescriptionStatus] = mapped_column(Enum(PrescriptionStatus, name="prescription_status"), nullable=False, default=PrescriptionStatus.PENDING_REVIEW, server_default="PENDING_REVIEW")
     rejection_reason: Mapped[str | None] = mapped_column(String(1000))
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"))

@@ -1,9 +1,10 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models import CommonUseCategory, DonationReviewDecision, DonationStatus
+from app.services.business_time import business_today
 
 
 class DonationCreate(BaseModel):
@@ -25,7 +26,7 @@ class DonationCreate(BaseModel):
     def expiry_not_past(cls, value: date | None) -> date | None:
         if value is None:
             return value
-        if value < datetime.now(timezone.utc).date():
+        if value < business_today():
             raise ValueError("Expiry date must be today or later")
         return value
 
@@ -90,14 +91,6 @@ class DonationVerifiedDetails(BaseModel):
             raise ValueError("This field cannot be blank")
         return value
 
-    @field_validator("expiry_date")
-    @classmethod
-    def verified_expiry_not_past(cls, value: date) -> date:
-        if value < datetime.now(timezone.utc).date():
-            raise ValueError("Expiry date must be today or later")
-        return value
-
-
 class DonationReviewCreate(BaseModel):
     decision: DonationReviewDecision
     reason: str | None = Field(default=None, max_length=2000)
@@ -120,6 +113,9 @@ class DonationReviewCreate(BaseModel):
             not self.physical_package_checked or self.verified_details is None
         ):
             raise ValueError("Physically check the package and submit verified medicine details before approval")
+        if (self.decision == DonationReviewDecision.APPROVED and self.verified_details is not None
+                and self.verified_details.expiry_date < business_today()):
+            raise ValueError("Expired medicine cannot be approved")
         return self
 
 

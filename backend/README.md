@@ -19,12 +19,24 @@ Copy-Item .env.example .env
 ```
 
 Edit `DATABASE_URL` in `.env` for your PostgreSQL instance when you are ready to run database migrations. Importing or starting the API does not connect to the database.
-Set `JWT_SECRET` to a long random value before using authentication. `JWT_ALGORITHM` and `JWT_EXPIRATION_MINUTES` are also configurable. Medicine image extraction uses Gemini 2.5 Flash by default; set `GEMINI_API_KEY` in the backend environment. `GEMINI_MODEL` can select another supported Gemini model. Set `MEDICINE_EXTRACTION_PROVIDER=paddleocr` to use the retained local PaddleOCR fallback. The pharmacist must still verify extracted fields against the package; OCR never approves a donation.
+Set `JWT_SECRET` to a long random value before using authentication, use this to get the jwt secret in the powershell : python -c "import secrets; print(secrets.token_urlsafe(48))"
+ `JWT_ALGORITHM` and `JWT_EXPIRATION_MINUTES` are also configurable. Medicine image extraction uses Gemini 2.5 Flash by default; set `GEMINI_API_KEY` in the backend environment. `GEMINI_MODEL` can select another supported Gemini model. Set `MEDICINE_EXTRACTION_PROVIDER=paddleocr` to use the retained local PaddleOCR fallback. The pharmacist must still verify extracted fields against the package; OCR never approves a donation.
 
 ## Run
+Commands to run MedShare locally:
 
+Backend:
 ```powershell
+cd D:\newMed\backend
+.\.venv\Scripts\Activate.ps1
+alembic upgrade head
 uvicorn app.main:app --reload
+```
+
+Frontend:
+```powershell
+cd D:\newMed\frontend
+npm run dev
 ```
 
 The health endpoint is `GET http://localhost:8000/health`. Authentication endpoints are `POST /auth/signup`, `POST /auth/login`, and `GET /auth/me`.
@@ -45,4 +57,4 @@ Migrations create and evolve the application schema. Revision `20261004_0015` re
 
 Clinic profiles start as `PENDING`. An authenticated platform administrator can review pending clinic details in the admin frontend or through `GET /admin/clinic-verifications/pending`, then approve with `POST /admin/clinic-verifications/{clinic_profile_id}/approve` or reject with a non-empty `reason` using `POST /admin/clinic-verifications/{clinic_profile_id}/reject`. Decisions record the administrator and timestamp. This records the platform's decision; review of submitted license details remains a manual operational step.
 
-Public signup does not offer the `ADMIN` role. After applying migrations, an authorized operator can provision an initial administrator from `backend/` with `python -m app.cli.create_admin reviewer@example.com --name "Platform Reviewer"`. The command prompts for a password without echoing it and stores only its hash. Administrators then sign in through the normal login page; never create an administrator through public signup or commit credentials to configuration or source.
+Public signup does not offer the `ADMIN` role. After applying migrations, an authorized operator can provision an initial administrator from `backend/` with `python -m app.cli.create_admin reviewer@example.com --name "Platform Reviewer"`. The command prompts for a password without echoing it and stores only its hash. To reset an existing administrator's password, run `python -m app.cli.create_admin reviewer@example.com --reset-password`; it verifies the account exists and has the `ADMIN` role, then prompts for and confirms the new password without echoing it. Administrators then sign in through the normal login page; never create an administrator through public signup or commit credentials to configuration or source.

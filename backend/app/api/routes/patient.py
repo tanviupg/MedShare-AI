@@ -1,4 +1,3 @@
-from datetime import date
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,6 +10,7 @@ from app.db.database import get_db
 from app.models import ClinicProfile, ClinicVerificationStatus, CommonUseCategory, Donation, DonationImage, DonationStatus, Inventory, InventoryStatus, User, UserRole
 from app.schemas.patient import PatientMedicineImage, PatientMedicineOption, PatientMedicinePage
 from app.api.routes.donations import storage
+from app.services.business_time import business_today
 
 router = APIRouter(prefix="/patient", tags=["patient discovery"])
 
@@ -25,7 +25,7 @@ def available_inventory_query():
             Inventory.status == InventoryStatus.AVAILABLE,
             Donation.status == DonationStatus.APPROVED,
             Inventory.quantity_available > 0,
-            Inventory.expiry_date >= date.today(),
+            Inventory.expiry_date >= business_today(),
             User.is_active.is_(True),
             ClinicProfile.verification_status == ClinicVerificationStatus.VERIFIED,
         )

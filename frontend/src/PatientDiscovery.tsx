@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { CalendarDays, ImageOff, MapPin, PackageCheck, Search, ShieldCheck, Upload, X } from 'lucide-react'
 import { API_BASE_URL } from './config'
+import { safeApiErrorMessage } from './apiErrors.mjs'
 
 type Medicine = {
   medicine_id: string
@@ -116,7 +117,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
       signal: controller.signal,
     }).then(async (response) => {
       const body = await response.json() as PageResult & { detail?: string }
-      if (!response.ok) throw new Error(body.detail ?? 'Could not load available medicines.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(body, 'Could not load available medicines.'))
       setResult(body)
     }).catch((reason: unknown) => {
       if (reason instanceof Error && reason.name !== 'AbortError') {
@@ -127,6 +128,14 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
     })
     return () => controller.abort()
   }, [token, name, category, city, clinic, page, discoveryRevision])
+
+  // Re-query discovery periodically so inventory that expires during an open
+  // dashboard disappears without requiring a navigation or manual refresh.
+  useEffect(() => {
+    if (tab !== 'search') return
+    const refresh = window.setInterval(() => setDiscoveryRevision((revision) => revision + 1), 60_000)
+    return () => window.clearInterval(refresh)
+  }, [tab])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -189,7 +198,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
         headers: { Authorization: `Bearer ${token}` },
       })
       const data = await response.json() as MedicineRequest[] & { detail?: string }
-      if (!response.ok) throw new Error(data.detail ?? 'Could not load your requests.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not load your requests.'))
       setRequests(data)
     } catch (cause) {
       setRequestMessage(cause instanceof Error ? cause.message : 'Could not load your requests.')
@@ -227,7 +236,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
           body: formData,
         })
         const data = await response.json() as MedicineRequest & { detail?: string }
-        if (!response.ok) throw new Error(data.detail ?? 'Could not submit the medicine request.')
+        if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not submit the medicine request.'))
         setRequestMessage('Request and prescription submitted for pharmacist review.')
         setPrescriptionFiles((current) => ({ ...current, [item.medicine_id]: undefined }))
         setPickupAddresses((current) => ({ ...current, [item.medicine_id]: '' }))
@@ -250,7 +259,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
         body: JSON.stringify({ medicine_id: item.medicine_id, requested_quantity: quantity, pickup_address: pickupAddress }),
       })
       const data = await response.json() as MedicineRequest & { detail?: string }
-      if (!response.ok) throw new Error(data.detail ?? 'Could not submit the medicine request.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not submit the medicine request.'))
 
       const prescription = prescriptionFiles[item.medicine_id]
       if (needsPrescription && prescription) {
@@ -311,7 +320,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
         body: formData,
       })
       const body = await response.json() as { detail?: string }
-      if (!response.ok) throw new Error(body.detail ?? 'Could not upload prescription.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(body, 'Could not upload prescription.'))
       setRequestFiles((current) => ({ ...current, [item.id]: undefined }))
       await loadRequests()
       setRequestMessage('Prescription uploaded for pharmacist verification.')
@@ -331,7 +340,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
         headers: { Authorization: `Bearer ${token}` },
       })
       const body = await response.json() as Checkout & { detail?: string }
-      if (!response.ok) throw new Error(body.detail ?? 'Could not open checkout.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(body, 'Could not open checkout.'))
       setCheckouts((current) => ({ ...current, [item.id]: body }))
       if (pay) {
         setRequestMessage('Your demo payment was recorded. No real money was charged.')

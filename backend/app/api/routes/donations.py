@@ -14,7 +14,7 @@ from app.schemas.donation import DonationCreate, DonationImageResponse, Donation
 from app.services.donation_storage import LocalDonationStorage
 from app.services.medicine_extraction import ExtractionConfigurationError, get_extraction_provider
 from app.models import ClinicProfile, ClinicVerificationStatus
-from datetime import date, datetime, timezone datetime, timezone
+from datetime import date, datetime, timezone
 from app.models import CommonUseCategory, NotificationType, prescription_required_for
 from app.services.notifications import notify, notify_verified_pharmacists
 
@@ -57,6 +57,12 @@ def pending_review_donation(donation_id: UUID, db: Session) -> Donation:
     return donation
 
 
+def require_verified_clinic(db: Session, user: User) -> None:
+    profile = db.scalar(select(ClinicProfile).where(ClinicProfile.user_id == user.id))
+    if profile is None or profile.verification_status != ClinicVerificationStatus.VERIFIED:
+        raise HTTPException(status_code=403, detail="A verified clinic is required to review donations")
+
+
 def _extract_images(donation: Donation, images: list[DonationImage], db: Session) -> None:
     provider = get_extraction_provider()
     for image in images:
@@ -90,12 +96,14 @@ def _extract_images(donation: Donation, images: list[DonationImage], db: Session
 
 @router.get("/review-queue", response_model=list[DonationResponse])
 def get_review_queue(db: Session = Depends(get_db), user: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))) -> list[DonationResponse]:
+    require_verified_clinic(db, user)
     donations = db.scalars(select(Donation).options(selectinload(Donation.images)).where(Donation.status == DonationStatus.PENDING_REVIEW, Donation.details_confirmed.is_(True)).order_by(Donation.created_at.asc())).all()
     return [donation_response(item) for item in donations]
 
 
 @router.get("/{donation_id}/review", response_model=DonationResponse)
 def get_review_donation(donation_id: UUID, db: Session = Depends(get_db), user: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))) -> DonationResponse:
+    require_verified_clinic(db, user)
     return donation_response(pending_review_donation(donation_id, db))
 
 
@@ -105,6 +113,7 @@ def extract_donation_images(
     db: Session = Depends(get_db),
     user: User = Depends(require_role(UserRole.CLINIC_PHARMACIST)),
 ) -> dict:
+    require_verified_clinic(db, user)
     donation = pending_review_donation(donation_id, db)
     if not donation.images:
         raise HTTPException(status_code=409, detail="Donation photos are required before running OCR")
@@ -122,6 +131,7 @@ def extract_donation_images(
 
 @router.post("/{donation_id}/review", response_model=DonationReviewResponse, status_code=status.HTTP_201_CREATED)
 def review_donation(donation_id: UUID, payload: DonationReviewCreate, db: Session = Depends(get_db), user: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))) -> DonationReviewResponse:
+    require_verified_clinic(db, user)
     donation = db.scalar(select(Donation).options(selectinload(Donation.images)).where(Donation.id == donation_id).with_for_update())
     if donation is None or donation.status != DonationStatus.PENDING_REVIEW:
         raise HTTPException(status_code=409, detail="Only donations awaiting review can be reviewed")
@@ -209,6 +219,7 @@ def extraction_response(row: MedicineExtraction) -> dict:
 
 @router.get("/{donation_id}/extraction")
 def get_extraction(donation_id: UUID, db: Session = Depends(get_db), user: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))) -> dict:
+    require_verified_clinic(db, user)
     donation = db.scalar(select(Donation).where(Donation.id == donation_id))
     if donation is None or (
         donation.status != DonationStatus.PENDING_REVIEW
@@ -252,6 +263,7 @@ async def add_donation_images(donation_id: UUID, files: list[UploadFile] = File(
             "donation",
             donation.id,
         )
+        notify(db, user.id, NotificationType.DONATION_SUBMITTED, "Donation submitted", "Your medicine donation was submitted for clinic review.", "donation", donation.id)
         db.commit()
     except Exception:
         db.rollback()
@@ -268,6 +280,7 @@ def get_donation_image(donation_id: UUID, image_id: UUID, db: Session = Depends(
     if user.role == UserRole.DONOR:
         donation = owned_donation(donation_id, user, db)
     else:
+        require_verified_clinic(db, user)
         donation = db.scalar(
             select(Donation).options(selectinload(Donation.images)).where(
                 Donation.id == donation_id,

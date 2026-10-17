@@ -30,6 +30,15 @@ class PendingClinicVerification(BaseModel):
     created_at: datetime
 
 
+class ClinicVerificationHistoryItem(PendingClinicVerification):
+    """Current clinic status plus the latest decision metadata, not a full audit trail."""
+
+    verification_status: ClinicVerificationStatus
+    verification_decided_at: datetime | None
+    reviewer_name: str | None
+    verification_rejection_reason: str | None
+
+
 class ClinicVerificationResult(BaseModel):
     verification_status: ClinicVerificationStatus
     verification_decided_at: datetime

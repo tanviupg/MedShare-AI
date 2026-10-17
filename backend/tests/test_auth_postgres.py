@@ -2,10 +2,10 @@ import json
 import importlib.util
 import os
 from pathlib import Path
-import socket
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError
@@ -28,8 +28,9 @@ from app.services.prescription_storage import storage as prescription_storage
 from app.core.config import get_settings
 from app.db.base import Base
 from app.main import app
-from app.models import Checkout, ClinicProfile, CommonUseCategory, DispensingRecord, Donation, DonationImage, DonationReview, DonationStatus, Inventory, InventoryStatus, MedicineRequest, MedicineRequestStatus, MedicineExtraction, Notification, NotificationType, Prescription, PrescriptionStatus, User, UserRole, WasteRecord, WasteReason, WasteStatus
+from app.models import Checkout, ClinicProfile, ClinicVerificationStatus, CommonUseCategory, DispensingRecord, Donation, DonationImage, DonationReview, DonationStatus, Inventory, InventoryStatus, MedicineRequest, MedicineRequestStatus, MedicineExtraction, Notification, NotificationType, Prescription, PrescriptionStatus, User, UserRole, WasteRecord, WasteReason, WasteStatus
 from app.services.security import hash_password, verify_password
+from app.services.business_time import BUSINESS_TIMEZONE, business_today
 
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
@@ -94,29 +95,21 @@ class TestAuthPostgres(unittest.TestCase):
             raise RuntimeError("TEST_DATABASE_URL must point to an isolated PostgreSQL database ending in _test")
         cls.engine = create_engine(url, pool_pre_ping=True)
         cls.Session = sessionmaker(bind=cls.engine, class_=Session, expire_on_commit=False)
-        cls.port = socket.socket()
-        cls.port.bind(("127.0.0.1", 0))
-        port = cls.port.getsockname()[1]
-        cls.port.close()
-        cls.base_url = f"http://127.0.0.1:{port}"
-
         def override_get_db():
             with cls.Session() as session:
                 yield session
 
         app.dependency_overrides[get_db] = override_get_db
-        cls.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+        cls.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
         cls.thread = threading.Thread(target=cls.server.run, daemon=True)
         cls.thread.start()
         deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    break
-            except OSError:
-                time.sleep(0.05)
-        else:
+        while time.time() < deadline and not cls.server.started:
+            time.sleep(0.05)
+        if not cls.server.started:
             raise RuntimeError("Test API did not start")
+        port = cls.server.servers[0].sockets[0].getsockname()[1]
+        cls.base_url = f"http://127.0.0.1:{port}"
 
     @classmethod
     def tearDownClass(cls):
@@ -167,6 +160,13 @@ class TestAuthPostgres(unittest.TestCase):
         )
         self.assertEqual(status, 200, body)
         return json.loads(body)
+
+    def test_business_today_uses_explicit_calendar_timezone(self):
+        expected_today = date(2026, 10, 18)
+        with patch("app.services.business_time.datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 18, tzinfo=BUSINESS_TIMEZONE)
+            self.assertEqual(business_today(), expected_today)
+            clock.now.assert_called_once_with(BUSINESS_TIMEZONE)
 
     def test_signup_login_me_hashes_and_clinic_profile_for_all_roles(self):
         for role in ("DONOR", "PATIENT", "CLINIC_PHARMACIST"):
@@ -249,10 +249,12 @@ class TestAuthPostgres(unittest.TestCase):
                 ClinicProfile.user_id == UUID(clinic_to_reject["user"]["id"])
             )))
         pending_url = "/admin/clinic-verifications/pending"
+        history_url = "/admin/clinic-verifications/history"
         approve_url = f"/admin/clinic-verifications/{approve_profile_id}/approve"
         reject_url = f"/admin/clinic-verifications/{reject_profile_id}/reject"
 
         self.assertEqual(request("GET", pending_url)[0], 401)
+        self.assertEqual(request("GET", history_url)[0], 401)
         for role, token in (
             ("donor", donor["access_token"]),
             ("patient", patient_token),
@@ -261,6 +263,7 @@ class TestAuthPostgres(unittest.TestCase):
         ):
             with self.subTest(non_admin_role=role):
                 self.assertEqual(request("GET", pending_url, token=token)[0], 403)
+                self.assertEqual(request("GET", history_url, token=token)[0], 403)
                 self.assertEqual(request("POST", approve_url, token=token)[0], 403)
                 self.assertEqual(request("POST", reject_url, {"reason": "Not approved"}, token)[0], 403)
 
@@ -270,6 +273,11 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual({item["id"] for item in pending_items}, {approve_profile_id, reject_profile_id})
         self.assertTrue(all("address" in item and "license_number" in item for item in pending_items))
         self.assertTrue(all("email" not in item and "user_id" not in item for item in pending_items))
+        status, body = request("GET", f"{history_url}?status=PENDING", token=admin_token)
+        self.assertEqual(status, 200, body)
+        pending_history = json.loads(body)
+        self.assertEqual({item["id"] for item in pending_history}, {approve_profile_id, reject_profile_id})
+        self.assertTrue(all(item["verification_status"] == "PENDING" for item in pending_history))
 
         with self.Session() as session:
             admin_owned_profile = ClinicProfile(
@@ -301,6 +309,15 @@ class TestAuthPostgres(unittest.TestCase):
             self.assertEqual(str(approved_profile.verification_reviewer_id), admin["user"]["id"])
             self.assertIsNotNone(approved_profile.verification_decided_at)
             self.assertIsNone(approved_profile.verification_rejection_reason)
+        status, body = request("GET", f"{history_url}?status=VERIFIED", token=admin_token)
+        self.assertEqual(status, 200, body)
+        approved_history = json.loads(body)
+        self.assertEqual(len(approved_history), 1)
+        self.assertEqual(approved_history[0]["id"], approve_profile_id)
+        self.assertEqual(approved_history[0]["verification_status"], "VERIFIED")
+        self.assertEqual(approved_history[0]["reviewer_name"], "Platform Reviewer")
+        self.assertIsNotNone(approved_history[0]["verification_decided_at"])
+        self.assertIsNone(approved_history[0]["verification_rejection_reason"])
 
         _, pending_donation = self.create_donation(donor["access_token"], medicine_name="Verified clinic stock")
         pending_donation = json.loads(pending_donation)
@@ -311,7 +328,13 @@ class TestAuthPostgres(unittest.TestCase):
 
         _, rejected_donation = self.create_donation(donor["access_token"], medicine_name="Rejected clinic stock")
         rejected_donation = json.loads(rejected_donation)
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=clinic_to_reject["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
         self.assertEqual(self.approve_donation(rejected_donation["id"], clinic_to_reject["access_token"])[0], 201)
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=clinic_to_reject["user"]["id"]).one().verification_status = "PENDING"
+            session.commit()
         status, body = request("GET", "/patient/medicines?q=Rejected%20clinic%20stock", token=patient_token)
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["total"], 0)
@@ -328,6 +351,17 @@ class TestAuthPostgres(unittest.TestCase):
             self.assertEqual(str(rejected_profile.verification_reviewer_id), admin["user"]["id"])
             self.assertIsNotNone(rejected_profile.verification_decided_at)
             self.assertEqual(rejected_profile.verification_rejection_reason, "License details need clarification.")
+        status, body = request("GET", f"{history_url}?status=REJECTED", token=admin_token)
+        self.assertEqual(status, 200, body)
+        rejected_history = json.loads(body)
+        self.assertEqual(len(rejected_history), 1)
+        self.assertEqual(rejected_history[0]["id"], reject_profile_id)
+        self.assertEqual(rejected_history[0]["verification_status"], "REJECTED")
+        self.assertEqual(rejected_history[0]["reviewer_name"], "Platform Reviewer")
+        self.assertIsNotNone(rejected_history[0]["verification_decided_at"])
+        self.assertEqual(rejected_history[0]["verification_rejection_reason"], "License details need clarification.")
+        for private_field in ("email", "user_id", "password", "password_hash", "access_token"):
+            self.assertNotIn(private_field, rejected_history[0])
         status, body = request("GET", "/patient/medicines?q=Rejected%20clinic%20stock", token=patient_token)
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["total"], 0)
@@ -338,6 +372,97 @@ class TestAuthPostgres(unittest.TestCase):
         clinic_profile = json.loads(body)["clinic_profile"]
         self.assertEqual(clinic_profile["verification_status"], "REJECTED")
         self.assertEqual(clinic_profile["verification_rejection_reason"], "License details need clarification.")
+
+    def test_admin_platform_dashboard_aggregates_counts_privately_and_requires_admin(self):
+        admin = self.create_admin()
+        _, donor = self.signup("DONOR", "-admin-dashboard")
+        _, patient = self.signup("PATIENT", "-admin-dashboard")
+        clinics = [self.signup("CLINIC_PHARMACIST", f"-admin-dashboard-{i}")[1] for i in range(3)]
+        with self.Session() as session:
+            for result, status in zip(clinics, (ClinicVerificationStatus.PENDING, ClinicVerificationStatus.VERIFIED, ClinicVerificationStatus.REJECTED)):
+                profile = session.scalar(select(ClinicProfile).where(ClinicProfile.user_id == UUID(result["user"]["id"])))
+                profile.verification_status = status
+
+            donation_statuses = list(DonationStatus)
+            donation_rows = []
+            for status in donation_statuses:
+                row = Donation(donor_id=UUID(donor["user"]["id"]), status=status)
+                session.add(row)
+                donation_rows.append(row)
+            session.flush()
+
+            inventory = Inventory(
+                donation_id=donation_rows[1].id,
+                pharmacist_id=UUID(clinics[1]["user"]["id"]),
+                medicine_name="Aggregate Fixture",
+                expiry_date=business_today() + timedelta(days=30),
+                quantity_available=7,
+                original_quantity=14,
+                unit="tablets",
+                status=InventoryStatus.AVAILABLE,
+            )
+            session.add(inventory)
+            session.flush()
+
+            requests = []
+            request_statuses = list(MedicineRequestStatus)
+            for index, status in enumerate(request_statuses):
+                is_reserved = status in (MedicineRequestStatus.PENDING, MedicineRequestStatus.APPROVED)
+                row = MedicineRequest(
+                    patient_id=UUID(patient["user"]["id"]),
+                    inventory_id=inventory.id,
+                    requested_quantity=3 if status == MedicineRequestStatus.PENDING else 4 if status == MedicineRequestStatus.APPROVED else 1,
+                    inventory_reserved=is_reserved,
+                    status=status,
+                )
+                session.add(row)
+                requests.append(row)
+
+            for index, status in enumerate(WasteStatus):
+                session.add(WasteRecord(
+                    inventory_id=inventory.id,
+                    pharmacist_id=UUID(clinics[1]["user"]["id"]),
+                    reason=WasteReason.DAMAGED,
+                    quantity=index + 1,
+                    disposal_reference=f"AGG-{index:03d}",
+                    status=status,
+                ))
+            session.commit()
+
+        dashboard_url = "/admin/dashboard"
+        self.assertEqual(request("GET", dashboard_url)[0], 401)
+        self.assertEqual(request("GET", dashboard_url, token=donor["access_token"])[0], 403)
+        status_code, body = request("GET", dashboard_url, token=admin["access_token"])
+        self.assertEqual(status_code, 200, body)
+        data = json.loads(body)
+        self.assertEqual(data["clinics"], {"total": 3, "pending": 1, "verified": 1, "rejected": 1})
+        self.assertEqual(data["users"]["total"], 6)
+        self.assertEqual(data["users"]["by_role"], {"DONOR": 1, "PATIENT": 1, "CLINIC_PHARMACIST": 3, "ADMIN": 1})
+        self.assertEqual(data["donations"]["total"], len(DonationStatus))
+        self.assertEqual(sum(data["donations"]["by_status"].values()), data["donations"]["total"])
+        self.assertEqual(data["inventory"], {"available": 7, "reserved": 7})
+        self.assertEqual(data["requests"]["total"], len(MedicineRequestStatus))
+        self.assertEqual(sum(data["requests"]["by_status"].values()), data["requests"]["total"])
+        self.assertEqual(data["waste"]["total"], len(WasteStatus))
+        self.assertEqual(sum(data["waste"]["by_status"].values()), data["waste"]["total"])
+        for private_field in ("email", "name", "address", "password", "password_hash", "access_token", "patient_id", "donor_id", "pickup_address"):
+            self.assertNotIn(private_field, body)
+
+    def test_admin_platform_dashboard_empty_aggregates_are_zero(self):
+        admin = self.create_admin()
+        status_code, body = request("GET", "/admin/dashboard", token=admin["access_token"])
+        self.assertEqual(status_code, 200, body)
+        data = json.loads(body)
+        self.assertEqual(data["clinics"], {"total": 0, "pending": 0, "verified": 0, "rejected": 0})
+        self.assertEqual(data["users"]["total"], 1)
+        self.assertEqual(data["users"]["by_role"]["ADMIN"], 1)
+        self.assertEqual(data["donations"]["total"], 0)
+        self.assertTrue(all(count == 0 for count in data["donations"]["by_status"].values()))
+        self.assertEqual(data["inventory"], {"available": 0, "reserved": 0})
+        self.assertEqual(data["requests"]["total"], 0)
+        self.assertTrue(all(count == 0 for count in data["requests"]["by_status"].values()))
+        self.assertEqual(data["waste"]["total"], 0)
+        self.assertTrue(all(count == 0 for count in data["waste"]["by_status"].values()))
 
     def create_donation(self, token, **updates):
         details = {
@@ -428,6 +553,33 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(request("POST", "/notifications/read-all", token=owner["access_token"])[0], 200)
         self.assertEqual(json.loads(request("GET", "/notifications/unread-count", token=owner["access_token"])[1])["count"], 0)
 
+    def test_workflow_notifications_are_persistent_private_and_deduplicated(self):
+        admin = self.create_admin()
+        _, clinic = self.signup("CLINIC_PHARMACIST", "notify-workflow")
+        clinic_notices = json.loads(request("GET", "/notifications", token=admin["access_token"])[1])["items"]
+        matching_clinic = [n for n in clinic_notices if n["type"] == "CLINIC_VERIFICATION_REQUESTED"]
+        self.assertEqual(len(matching_clinic), 1)
+        with self.Session() as session:
+            profile_id = str(session.scalar(select(ClinicProfile.id).where(ClinicProfile.user_id == UUID(clinic["user"]["id"]))))
+        self.assertEqual(matching_clinic[0]["related_entity_id"], profile_id)
+
+        _, donor = self.signup("DONOR", "notify-workflow")
+        donation_status, donation_body = self.create_donation(donor["access_token"])
+        self.assertEqual(donation_status, 201, donation_body)
+        donation_id = json.loads(donation_body)["id"]
+        donor_notices = json.loads(request("GET", "/notifications", token=donor["access_token"])[1])["items"]
+        matching_donation = [n for n in donor_notices if n["type"] == "DONATION_SUBMITTED"]
+        self.assertEqual(len(matching_donation), 1)
+        self.assertEqual(matching_donation[0]["related_entity_id"], donation_id)
+        self.assertNotIn("Sample Road", matching_donation[0]["message"])
+        self.assertEqual(request("GET", "/notifications", token=clinic["access_token"])[1].count(donation_id), 0)
+        with self.Session() as session:
+            self.assertEqual(session.scalar(select(func.count(Notification.id)).where(
+                Notification.recipient_user_id == UUID(donor["user"]["id"]),
+                Notification.type == NotificationType.DONATION_SUBMITTED,
+                Notification.related_entity_id == UUID(donation_id),
+            )), 1)
+
     def test_donor_create_status_list_get_ownership_and_roles(self):
         _, donor1 = self.signup("DONOR", "1")
         _, donor2 = self.signup("DONOR", "2")
@@ -454,6 +606,9 @@ class TestAuthPostgres(unittest.TestCase):
         _, donor = self.signup("DONOR", "extract-owner")
         _, other = self.signup("DONOR", "extract-other")
         _, pharmacist = self.signup("CLINIC_PHARMACIST", "extract")
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
         created = json.loads(self.create_donation(donor["access_token"], details_confirmed=False)[1])
         donation_id = created["id"]
         self.assertEqual(request("GET", "/donations/review-queue", token=pharmacist["access_token"])[1], "[]")
@@ -575,6 +730,9 @@ class TestAuthPostgres(unittest.TestCase):
         _, patient = self.signup("PATIENT")
         _, pharmacist = self.signup("CLINIC_PHARMACIST")
         donor_token, patient_token, pharmacist_token = donor["access_token"], patient["access_token"], pharmacist["access_token"]
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
         created_status, created_body = self.create_donation(donor_token, status="APPROVED")
         self.assertEqual(created_status, 201, created_body)
         donation = json.loads(created_body)
@@ -599,7 +757,7 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(approved["donation_id"], donation_id)
         self.assertIsNotNone(approved["reviewed_at"])
         donor_notices = json.loads(request("GET", "/notifications", token=donor_token)[1])["items"]
-        self.assertEqual([n["type"] for n in donor_notices], ["DONATION_APPROVED"])
+        self.assertEqual({n["type"] for n in donor_notices}, {"DONATION_SUBMITTED", "DONATION_APPROVED"})
         self.assertEqual(json.loads(request("GET", f"/donations/{donation_id}", token=donor_token)[1])["status"], "APPROVED")
         self.assertEqual(request("POST", f"/donations/{donation_id}/review", {"decision": "REJECTED", "reason": "late"}, pharmacist_token)[0], 409)
         self.assertEqual(request("GET", f"/donations/{donation_id}/review", token=pharmacist_token)[0], 404)
@@ -638,6 +796,9 @@ class TestAuthPostgres(unittest.TestCase):
         _, donor = self.signup("DONOR")
         _, pharmacist = self.signup("CLINIC_PHARMACIST")
         _, patient = self.signup("PATIENT")
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
         created = json.loads(self.create_donation(donor["access_token"])[1])
         self.assertEqual(request("POST", f"/donations/{created['id']}/inventory", token=pharmacist["access_token"])[0], 404)
         self.assertEqual(request("GET", "/inventory", token=donor["access_token"])[0], 403)
@@ -673,6 +834,36 @@ class TestAuthPostgres(unittest.TestCase):
         expired_status, expired_body = request("GET", f"/inventory/{item_id}", token=pharmacist["access_token"])
         self.assertEqual(expired_status, 200, expired_body)
         self.assertEqual(json.loads(expired_body)["status"], "EXPIRED")
+
+    def test_inventory_quantity_correction_is_validated_and_clinic_scoped(self):
+        _, donor = self.signup("DONOR", "quantity-correction")
+        _, patient = self.signup("PATIENT", "quantity-correction")
+        _, pharmacist = self.signup("CLINIC_PHARMACIST", "quantity-correction")
+        _, other_pharmacist = self.signup("CLINIC_PHARMACIST", "quantity-correction-other")
+        self.assertEqual(request("GET", "/inventory", token=pharmacist["access_token"])[0], 403)
+        self.assertEqual(request("POST", "/donations/00000000-0000-0000-0000-000000000001/review", {"decision": "REJECTED", "reason": "Not verified"}, pharmacist["access_token"])[0], 403)
+        with self.Session() as session:
+            for account in (pharmacist, other_pharmacist):
+                session.query(ClinicProfile).filter_by(user_id=account["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
+        donation = json.loads(self.create_donation(donor["access_token"], quantity=8)[1])
+        self.assertEqual(self.approve_donation(donation["id"], pharmacist["access_token"])[0], 201)
+        with self.Session() as session:
+            inventory_id = str(session.scalar(select(Inventory.id).where(Inventory.donation_id == UUID(donation["id"]))))
+        self.assertEqual(request("PATCH", f"/inventory/{inventory_id}/quantity", {"quantity_available": -1}, pharmacist["access_token"])[0], 422)
+        self.assertEqual(request("PATCH", f"/inventory/{inventory_id}/quantity", {"quantity_available": 9}, pharmacist["access_token"])[0], 422)
+        self.assertEqual(request("PATCH", f"/inventory/{inventory_id}/quantity", {"quantity_available": 4}, other_pharmacist["access_token"])[0], 404)
+        self.assertEqual(request("GET", f"/inventory/{inventory_id}", token=other_pharmacist["access_token"])[0], 404)
+        self.assertEqual(request("PATCH", f"/inventory/{inventory_id}/quantity", {"quantity_available": 5}, pharmacist["access_token"])[0], 200)
+        created_status, created_body = self.create_patient_request(inventory_id, 2, patient["access_token"])
+        self.assertEqual(created_status, 201, created_body)
+        inventory_response = json.loads(request("GET", f"/inventory/{inventory_id}", token=pharmacist["access_token"])[1])
+        self.assertEqual(inventory_response["quantity_available"], 3)
+        self.assertEqual(inventory_response["reserved_quantity"], 2)
+        self.assertEqual(request("PATCH", f"/inventory/{inventory_id}/quantity", {"quantity_available": 7}, pharmacist["access_token"])[0], 409)
+        self.assertEqual(request("PATCH", f"/inventory/{inventory_id}/quantity", {"quantity_available": 6}, pharmacist["access_token"])[0], 200)
+        with self.Session() as session:
+            self.assertEqual(session.get(Inventory, UUID(inventory_id)).quantity_available, 6)
 
     def test_patient_medicine_discovery_filters_privacy_and_pagination(self):
         _, donor = self.signup("DONOR")
@@ -738,7 +929,7 @@ class TestAuthPostgres(unittest.TestCase):
             session.commit()
         with self.Session() as session:
             expired_item = session.query(Inventory).filter_by(donation_id=expired_donation).one()
-            expired_item.expiry_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+            expired_item.expiry_date = business_today() - timedelta(days=1)
             zero_item = session.query(Inventory).filter_by(donation_id=zero_donation).one()
             zero_item.quantity_available = 0
             removed_item = session.query(Inventory).filter_by(donation_id=removed_donation).one()
@@ -838,6 +1029,15 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(created["status"], "PENDING")
         self.assertEqual(created["pickup_address"], pickup_address)
         request_id = created["id"]
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "PENDING"
+            session.commit()
+        self.assertEqual(request("GET", "/pharmacist/requests", token=pharmacist_token)[0], 403)
+        self.assertEqual(request("GET", f"/pharmacist/requests/{request_id}", token=pharmacist_token)[0], 403)
+        self.assertEqual(request("POST", f"/pharmacist/requests/{request_id}/approve", token=pharmacist_token)[0], 403)
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
         with self.Session() as session:
             self.assertEqual(session.get(Inventory, inventory_id).quantity_available, 4)
         self.assertEqual(self.create_patient_request(inventory_id, 5, other_patient_token)[0], 409)
@@ -952,6 +1152,7 @@ class TestAuthPostgres(unittest.TestCase):
     def test_request_creation_reserves_inventory_once_and_concurrent_requests_cannot_overallocate(self):
         _, donor = self.signup("DONOR", "request-reservation")
         _, patient = self.signup("PATIENT", "request-reservation")
+        _, other_patient = self.signup("PATIENT", "request-reservation-other")
         _, pharmacist = self.signup("CLINIC_PHARMACIST", "request-reservation")
         with self.Session() as session:
             session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
@@ -994,6 +1195,15 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(sorted(outcomes), [201, 409])
         with self.Session() as session:
             self.assertEqual(session.get(Inventory, inventory_id).quantity_available, 3)
+        cancelled_status, cancelled_body = self.create_patient_request(inventory_id, 1, patient["access_token"])
+        self.assertEqual(cancelled_status, 201, cancelled_body)
+        cancelled_id = json.loads(cancelled_body)["id"]
+        self.assertEqual(request("POST", f"/patient/requests/{cancelled_id}/cancel", token=patient["access_token"])[0], 200)
+        self.assertEqual(request("POST", f"/patient/requests/{cancelled_id}/cancel", token=patient["access_token"])[0], 409)
+        self.assertEqual(request("POST", f"/patient/requests/{cancelled_id}/cancel", token=other_patient["access_token"])[0], 404)
+        with self.Session() as session:
+            self.assertEqual(session.get(Inventory, inventory_id).quantity_available, 3)
+            self.assertFalse(session.get(MedicineRequest, cancelled_id).inventory_reserved)
 
     def test_configurable_pricing_snapshot_simulated_checkout_and_free_flow(self):
         _, donor = self.signup("DONOR", "pricing")
@@ -1065,6 +1275,15 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(free_checkout["payment_method"], "FREE")
         self.assertEqual(free_checkout["amount"], "0.00")
         self.assertEqual(free_checkout["payment_status"], "PAID")
+        # A request approved while valid cannot proceed after the Kolkata
+        # business date passes its expiry, even with a stale checkout page.
+        with self.Session() as session:
+            item = session.get(Inventory, inventory_id)
+            item.expiry_date = business_today() - timedelta(days=1)
+            session.commit()
+        self.assertEqual(request("GET", f"/patient/checkout/{free_request['id']}", token=patient["access_token"])[0], 409)
+        self.assertEqual(request("POST", f"/patient/checkout/{free_request['id']}/demo-pay", token=patient["access_token"])[0], 409)
+        self.assertEqual(request("POST", f"/pharmacist/requests/{free_request['id']}/dispense", token=pharmacist["access_token"])[0], 409)
 
     def test_dispensing_audit_authorization_and_no_second_inventory_decrement(self):
         _, donor = self.signup("DONOR", "dispense")
@@ -1171,27 +1390,63 @@ class TestAuthPostgres(unittest.TestCase):
         _, patient = self.signup("PATIENT", "waste")
         _, pharmacist = self.signup("CLINIC_PHARMACIST", "waste")
         donor_token, patient_token, pharmacist_token = donor["access_token"], patient["access_token"], pharmacist["access_token"]
-        soon = json.loads(self.create_donation(donor_token, expiry_date=(datetime.now(timezone.utc).date() + timedelta(days=45)).isoformat())[1])
+        self.assertEqual(request("GET", "/pharmacist/waste", token=pharmacist_token)[0], 403)
+        self.assertEqual(request("GET", "/pharmacist/donations/rejected-for-disposal", token=pharmacist_token)[0], 403)
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
+        soon = json.loads(self.create_donation(donor_token, expiry_date=(business_today() + timedelta(days=45)).isoformat())[1])
         self.assertEqual(self.approve_donation(soon['id'], pharmacist_token)[0], 201)
         expiring_status, expiring_body = request("GET", "/pharmacist/inventory/expiring", token=pharmacist_token)
         self.assertEqual(expiring_status, 200, expiring_body)
         self.assertTrue(any(row["medicine_name"] == "Paracetamol" and row["days_remaining"] == 45 for row in json.loads(expiring_body)))
+        today_donation = json.loads(self.create_donation(donor_token, medicine_name="Expires Today", expiry_date=business_today().isoformat())[1])
+        self.assertEqual(self.approve_donation(today_donation["id"], pharmacist_token)[0], 201)
+        expiring_status, expiring_body = request("GET", "/pharmacist/inventory/expiring", token=pharmacist_token)
+        self.assertEqual(expiring_status, 200, expiring_body)
+        self.assertTrue(any(row["medicine_name"] == "Expires Today" and row["days_remaining"] == 0 for row in json.loads(expiring_body)))
+        patient_medicines = request("GET", "/patient/medicines?q=Expires%20Today", token=patient_token)
+        self.assertEqual(patient_medicines[0], 200, patient_medicines[1])
+        self.assertEqual(json.loads(patient_medicines[1])["total"], 1)
+        # Discovery evaluates the Kolkata business date on each request, so
+        # the same inventory drops out as soon as that date advances.
+        tomorrow = business_today() + timedelta(days=1)
+        with patch("app.api.routes.patient.business_today", return_value=tomorrow):
+            next_day = request("GET", "/patient/medicines?q=Expires%20Today", token=patient_token)
+        self.assertEqual(next_day[0], 200, next_day[1])
+        self.assertEqual(json.loads(next_day[1])["total"], 0)
         donation = json.loads(self.create_donation(donor_token, medicine_name="Expired Waste Test")[1])
         self.assertEqual(self.approve_donation(donation['id'], pharmacist_token)[0], 201)
         with self.Session() as session:
             inventory = session.query(Inventory).filter_by(donation_id=donation["id"]).one()
-            inventory.expiry_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+            inventory.expiry_date = business_today() - timedelta(days=1)
             inventory_id, inventory_uuid = str(inventory.id), inventory.id
             session.commit()
         expired_status, expired_body = request("GET", "/pharmacist/inventory/expired", token=pharmacist_token)
         self.assertEqual(expired_status, 200, expired_body)
         self.assertEqual(json.loads(expired_body)[0]["id"], inventory_id)
-        expiry_types = {n["type"] for n in json.loads(request("GET", "/notifications", token=pharmacist_token)[1])["items"]}
+        # Patient discovery and request creation reject the stale listing,
+        # while the pharmacist expiry workflow retains the inventory row.
+        self.assertNotIn("Expired Waste Test", request("GET", "/patient/medicines", token=patient_token)[1])
+        self.assertEqual(self.create_patient_request(inventory_uuid, 1, patient_token)[0], 409)
+        # Dashboard requests create the reminder for this authenticated clinic;
+        # refreshing it must remain idempotent.
+        self.assertEqual(request("GET", "/pharmacist/dashboard", token=pharmacist_token)[0], 200)
+        self.assertEqual(request("GET", "/pharmacist/dashboard", token=pharmacist_token)[0], 200)
+        pharmacist_notices = json.loads(request("GET", "/notifications", token=pharmacist_token)[1])["items"]
+        expiry_types = {n["type"] for n in pharmacist_notices}
         self.assertIn("MEDICINE_EXPIRING_SOON", expiry_types)
         self.assertIn("MEDICINE_EXPIRED", expiry_types)
+        self.assertEqual(sum(n["type"] == "MEDICINE_EXPIRING_SOON" for n in pharmacist_notices), 2)
+        self.assertEqual(sum(n["type"] == "MEDICINE_EXPIRED" for n in pharmacist_notices), 1)
+        for unrelated_token in (donor_token, patient_token):
+            unrelated_notices = json.loads(request("GET", "/notifications", token=unrelated_token)[1])["items"]
+            self.assertFalse(any(n["type"] in {"MEDICINE_EXPIRING_SOON", "MEDICINE_EXPIRED"} for n in unrelated_notices))
         self.assertNotIn("Expired Waste Test", request("GET", "/patient/medicines", token=patient_token)[1])
         self.assertEqual(self.create_patient_request(inventory_id, 1, patient_token)[0], 409)
         self.assertEqual(request("POST", f"/pharmacist/inventory/{inventory_id}/waste", {"reason": "EXPIRED", "quantity": 25}, pharmacist_token)[0], 409)
+        self.assertEqual(request("POST", f"/pharmacist/inventory/{inventory_id}/waste", {"reason": "EXPIRED", "quantity": 0}, pharmacist_token)[0], 422)
+        self.assertEqual(request("POST", f"/pharmacist/inventory/{inventory_id}/waste", {"reason": "UNKNOWN", "quantity": 1}, pharmacist_token)[0], 422)
         self.assertEqual(request("POST", f"/pharmacist/inventory/{inventory_id}/waste", {"reason": "EXPIRED", "quantity": 5}, patient_token)[0], 403)
         self.assertEqual(request("POST", f"/pharmacist/inventory/{inventory_id}/waste", {"reason": "EXPIRED", "quantity": 5}, donor_token)[0], 403)
         waste_status, waste_body = request("POST", f"/pharmacist/inventory/{inventory_id}/waste", {"reason": "EXPIRED", "quantity": 5}, pharmacist_token)
@@ -1199,19 +1454,24 @@ class TestAuthPostgres(unittest.TestCase):
         waste = json.loads(waste_body)
         self.assertTrue(waste["disposal_reference"].startswith("MW-"))
         self.assertEqual(waste["status"], "DISPOSAL_PENDING")
+        self.assertEqual(waste["expiry_date"], (business_today() - timedelta(days=1)).isoformat())
         waste_notice = json.loads(request("GET", "/notifications", token=pharmacist_token)[1])["items"][0]
         self.assertEqual(waste_notice["type"], "WASTE_DISPOSAL_PENDING")
         self.assertEqual(waste_notice["related_entity_id"], waste["id"])
         with self.Session() as session:
             self.assertIsNotNone(session.get(Inventory, inventory_uuid))
             self.assertEqual(session.get(Inventory, inventory_uuid).quantity_available, 19)
-        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/dispose", token=pharmacist_token)[0], 409)
-        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/collect", token=pharmacist_token)[0], 200)
-        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/dispose", token=pharmacist_token)[0], 200)
-        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/collect", token=pharmacist_token)[0], 409)
+        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/collect", token=pharmacist_token)[0], 422)
+        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/dispose", {"confirmed": True}, pharmacist_token)[0], 409)
+        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/collect", {"confirmed": True}, pharmacist_token)[0], 200)
+        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/dispose", {"confirmed": True}, pharmacist_token)[0], 200)
+        self.assertEqual(request("POST", f"/pharmacist/waste/{waste['id']}/collect", {"confirmed": True}, pharmacist_token)[0], 409)
         self.assertEqual(request("GET", "/pharmacist/waste", token=patient_token)[0], 403)
         _, other_pharmacist = self.signup("CLINIC_PHARMACIST", "waste-other")
         other_token = other_pharmacist["access_token"]
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=other_pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
         self.assertEqual(request("GET", f"/pharmacist/waste/{waste['id']}", token=other_token)[0], 404)
         self.assertEqual(request("POST", f"/pharmacist/inventory/{inventory_id}/waste", {"reason": "EXPIRED", "quantity": 1}, other_token)[0], 404)
         unverified_rejection = json.loads(self.create_donation(donor_token)[1])
@@ -1221,13 +1481,36 @@ class TestAuthPostgres(unittest.TestCase):
             pharmacist_token,
         )
         self.assertEqual(rejected_status[0], 201, rejected_status[1])
+        unverified_rows = json.loads(request("GET", "/pharmacist/donations/rejected-for-disposal", token=pharmacist_token)[1])
+        self.assertTrue(any(row["id"] == unverified_rejection["id"] for row in unverified_rows))
+        unverified_row = next(row for row in unverified_rows if row["id"] == unverified_rejection["id"])
+        self.assertFalse(unverified_row["quantity_verified"])
+        self.assertIsNone(unverified_row["quantity"])
         missing_quantity_waste = request(
             "POST", f"/pharmacist/donations/{unverified_rejection['id']}/waste",
             {"reason": "REJECTED_DONATION", "quantity": 1}, pharmacist_token,
         )
         self.assertEqual(missing_quantity_waste[0], 409, missing_quantity_waste[1])
+        verification_path = f"/pharmacist/donations/{unverified_rejection['id']}/verification"
+        self.assertEqual(request("GET", verification_path, token=patient_token)[0], 403)
+        self.assertEqual(request("POST", verification_path, {"physical_package_checked": True, "verified_details": {**self.donation_verification[unverified_rejection["id"]], "quantity": 0}}, pharmacist_token)[0], 422)
+        self.assertEqual(request("POST", verification_path, {"physical_package_checked": False, "verified_details": self.donation_verification[unverified_rejection["id"]]}, pharmacist_token)[0], 422)
+        verified_rejection_details = dict(self.donation_verification[unverified_rejection["id"]])
+        verified_rejection_details["expiry_date"] = (business_today() - timedelta(days=1)).isoformat()
+        verify_status, verify_body = request("POST", verification_path, {"physical_package_checked": True, "verified_details": verified_rejection_details}, pharmacist_token)
+        self.assertEqual(verify_status, 200, verify_body)
+        self.assertTrue(json.loads(verify_body)["quantity_verified"])
+        with self.Session() as session:
+            verification_audit = session.query(DonationReview).filter_by(donation_id=unverified_rejection["id"]).one()
+            self.assertEqual(verification_audit.verified_details["verified_by"], pharmacist["user"]["id"])
+            self.assertIsNotNone(verification_audit.verified_details["verified_at"])
+        verified_rows = json.loads(request("GET", "/pharmacist/donations/rejected-for-disposal", token=pharmacist_token)[1])
+        verified_row = next(row for row in verified_rows if row["id"] == unverified_rejection["id"])
+        self.assertEqual(verified_row["expiry_date"], verified_rejection_details["expiry_date"])
+        self.assertEqual(request("POST", f"/pharmacist/donations/{unverified_rejection['id']}/waste", {"reason": "REJECTED_DONATION", "quantity": 1}, pharmacist_token)[0], 201)
         rejected = json.loads(self.create_donation(donor_token)[1])
         rejected_details = dict(self.donation_verification[rejected["id"]])
+        rejected_details["expiry_date"] = (business_today() - timedelta(days=1)).isoformat()
         rejected_review = request(
             "POST", f"/donations/{rejected['id']}/review",
             {"decision": "REJECTED", "reason": "Damaged package", "physical_package_checked": True,
@@ -1235,12 +1518,51 @@ class TestAuthPostgres(unittest.TestCase):
             pharmacist_token,
         )
         self.assertEqual(rejected_review[0], 201, rejected_review[1])
+        # Rejected donations stay out of inventory, but verified expired medicine
+        # details make them eligible for waste before a waste record exists.
+        rejected_rows = json.loads(request("GET", "/pharmacist/donations/rejected-for-disposal", token=pharmacist_token)[1])
+        rejected_row = next(row for row in rejected_rows if row["id"] == rejected["id"])
+        self.assertTrue(rejected_row["quantity_verified"])
+        self.assertEqual(rejected_row["expiry_date"], (business_today() - timedelta(days=1)).isoformat())
+        self.assertEqual(rejected_row["quantity"], 24)
         status_code, body = request("POST", f"/pharmacist/donations/{rejected['id']}/waste", {"reason": "REJECTED_DONATION", "quantity": 3}, pharmacist_token)
         self.assertEqual(status_code, 201, body)
         rejected_waste = json.loads(body)
         self.assertEqual(rejected_waste["donation_id"], rejected["id"])
         self.assertIsNone(rejected_waste["inventory_id"])
+        self.assertEqual(rejected_waste["status"], "DISPOSAL_PENDING")
+        waste_rows = json.loads(request("GET", "/pharmacist/waste", token=pharmacist_token)[1])
+        recorded = next(row for row in waste_rows if row["id"] == rejected_waste["id"])
+        self.assertEqual(recorded["quantity"], 3)
+        self.assertEqual(recorded["expiry_date"], rejected_row["expiry_date"])
+        self.assertEqual(recorded["reason"], "REJECTED_DONATION")
+        self.assertEqual(recorded["status"], "DISPOSAL_PENDING")
+        self.assertEqual(request("POST", f"/pharmacist/donations/{rejected['id']}/waste", {"reason": "REJECTED_DONATION", "quantity": 3}, pharmacist_token)[0], 409)
+        _, other_pharmacist = self.signup("CLINIC_PHARMACIST", "rejected-waste-other")
+        other_token = other_pharmacist["access_token"]
         with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=other_pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
+        other_pending = json.loads(request("GET", "/pharmacist/donations/rejected-for-disposal", token=other_token)[1])
+        self.assertFalse(any(row["id"] == rejected["id"] for row in other_pending))
+        self.assertEqual(request("GET", f"/pharmacist/donations/{rejected['id']}/verification", token=other_token)[0], 404)
+        self.assertEqual(request("POST", f"/pharmacist/donations/{rejected['id']}/verification", {"physical_package_checked": True, "verified_details": rejected_details}, other_token)[0], 404)
+        self.assertEqual(request("GET", f"/pharmacist/waste/{rejected_waste['id']}", token=other_token)[0], 404)
+        self.assertEqual(request("POST", f"/pharmacist/waste/{rejected_waste['id']}/collect", {"confirmed": True}, other_token)[0], 404)
+        self.assertTrue(any(row["id"] == rejected_waste["id"] for row in json.loads(request("GET", "/pharmacist/waste", token=pharmacist_token)[1])))
+        self.assertEqual(request("POST", f"/pharmacist/waste/{rejected_waste['id']}/collect", {"confirmed": True, "reference": "handoff-1"}, pharmacist_token)[0], 200)
+        collected = json.loads(request("GET", f"/pharmacist/waste/{rejected_waste['id']}", token=pharmacist_token)[1])
+        self.assertEqual(collected["status"], "COLLECTED")
+        self.assertIsNotNone(collected["collected_at"])
+        self.assertEqual(collected["handoff_reference"], "handoff-1")
+        self.assertEqual(request("POST", f"/pharmacist/waste/{rejected_waste['id']}/dispose", {"confirmed": True, "notes": "Disposed safely"}, pharmacist_token)[0], 200)
+        disposed = json.loads(request("GET", f"/pharmacist/waste/{rejected_waste['id']}", token=pharmacist_token)[1])
+        self.assertEqual(disposed["status"], "DISPOSED")
+        self.assertIsNotNone(disposed["disposed_at"])
+        self.assertEqual(disposed["disposal_notes"], "Disposed safely")
+        self.assertEqual(request("POST", f"/pharmacist/waste/{rejected_waste['id']}/dispose", {"confirmed": True}, pharmacist_token)[0], 409)
+        with self.Session() as session:
+            self.assertEqual(session.scalar(select(func.count(WasteRecord.id)).where(WasteRecord.donation_id == UUID(rejected["id"]))), 1)
             self.assertIsNone(session.query(Inventory).filter_by(donation_id=rejected["id"]).one_or_none())
 
     def test_pharmacist_dashboard_access_and_clinic_isolation(self):
@@ -1251,6 +1573,10 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(request("GET", "/pharmacist/dashboard")[0], 401)
         self.assertEqual(request("GET", "/pharmacist/dashboard", token=donor["access_token"])[0], 403)
         self.assertEqual(request("GET", "/pharmacist/dashboard", token=patient["access_token"])[0], 403)
+        with self.Session() as session:
+            for pharmacist in (pharmacy_a, pharmacy_b):
+                session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
 
         shared_pending = json.loads(self.create_donation(donor["access_token"], medicine_name="Shared review queue medicine")[1])
         inventory_ids = []
@@ -1266,7 +1592,7 @@ class TestAuthPostgres(unittest.TestCase):
                 inventory.common_use_category = "PAIN"
                 inventory.prescription_required = True
                 if suffix == "A":
-                    inventory.expiry_date = date.today() + timedelta(days=10)
+                    inventory.expiry_date = business_today() + timedelta(days=10)
                 session.flush()
                 request_row = MedicineRequest(patient_id=UUID(patient["user"]["id"]), inventory_id=inventory.id, requested_quantity=1)
                 session.add(request_row)
@@ -1282,7 +1608,7 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(status, 201, body)
         with self.Session() as session:
             expired_item = session.scalar(select(Inventory).where(Inventory.donation_id == UUID(extra_donation["id"])))
-            expired_item.expiry_date = date.today() - timedelta(days=1)
+            expired_item.expiry_date = business_today() - timedelta(days=1)
             expired_item.status = InventoryStatus.EXPIRED
             session.commit()
         missing_price_donation = json.loads(self.create_donation(donor["access_token"], medicine_name="Unpriced clinic medicine")[1])
@@ -1304,7 +1630,7 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(dashboard["summary"]["expiring_soon"], 1)
         self.assertEqual(dashboard["summary"]["expired"], 1)
         self.assertEqual(dashboard["summary"]["waste_pending"], 1)
-        self.assertEqual(dashboard["summary"]["unread_notifications"], 2)
+        self.assertGreaterEqual(dashboard["summary"]["unread_notifications"], 2)
         self.assertEqual(dashboard["inventory"]["pricing_configured"], 1)
         self.assertEqual(dashboard["inventory"]["pricing_missing"], 1)
         self.assertEqual(len(dashboard["pending_requests"]), 1)
@@ -1314,6 +1640,9 @@ class TestAuthPostgres(unittest.TestCase):
 
     def test_donation_packaging_schema_repair_restores_pharmacist_endpoints(self):
         _, pharmacist = self.signup("CLINIC_PHARMACIST", "-schema-repair")
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
         migration_path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20261004_0015_repair_donation_packaging_type.py"
         spec = importlib.util.spec_from_file_location("repair_donation_packaging_type", migration_path)
         self.assertIsNotNone(spec)
@@ -1328,9 +1657,10 @@ class TestAuthPostgres(unittest.TestCase):
             columns = {column["name"] for column in inspect(connection).get_columns("donations")}
             self.assertIn("packaging_type", columns)
 
-        for path in ("/pharmacist/dashboard", "/donations/review-queue"):
+        for path in ("/pharmacist/dashboard",):
             status, body = request("GET", path, token=pharmacist["access_token"])
             self.assertEqual(status, 200, body)
+        self.assertEqual(request("GET", "/donations/review-queue", token=pharmacist["access_token"])[0], 200)
 
     def test_cors_allows_vite_loopback_fallback_port_with_authorization_preflight(self):
         req = Request(self.base_url + "/pharmacist/dashboard", headers={

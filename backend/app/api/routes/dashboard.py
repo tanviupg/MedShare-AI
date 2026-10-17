@@ -1,6 +1,6 @@
-from datetime import date, datetime, timedelta, timezone
+from datetime import timedelta
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
@@ -9,9 +9,11 @@ from app.api.routes.inventory import expire_old_inventory
 from app.core.config import get_settings
 from app.db.database import get_db
 from app.models import (Checkout, Donation, DonationStatus, ExtractionStatus, Inventory,
-    InventoryStatus, MedicineExtraction, MedicineRequest, MedicineRequestStatus,
+    ClinicProfile, ClinicVerificationStatus, InventoryStatus, MedicineExtraction, MedicineRequest, MedicineRequestStatus,
     Notification, PaymentStatus, Prescription, PrescriptionStatus, User, UserRole,
     WasteRecord, WasteStatus)
+from app.services.notifications import notify_expiry_reminders
+from app.services.business_time import business_today
 
 router = APIRouter(prefix="/pharmacist", tags=["pharmacist dashboard"])
 
@@ -19,8 +21,12 @@ router = APIRouter(prefix="/pharmacist", tags=["pharmacist dashboard"])
 @router.get("/dashboard")
 def pharmacist_dashboard(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
     """Return a bounded operational snapshot, scoped to the authenticated pharmacist."""
+    profile = db.scalar(select(ClinicProfile).where(ClinicProfile.user_id == pharmacist.id))
+    if profile is None or profile.verification_status != ClinicVerificationStatus.VERIFIED:
+        raise HTTPException(status_code=403, detail="A verified clinic is required to access the pharmacist dashboard")
+    notify_expiry_reminders(db, pharmacist_id=pharmacist.id)
     expire_old_inventory(db, pharmacist.id)
-    today = datetime.now(timezone.utc).date()
+    today = business_today()
     warning_end = today + timedelta(days=get_settings().expiry_warning_days)
     active = (Inventory.pharmacist_id == pharmacist.id, Inventory.quantity_available > 0)
     live = (*active, Inventory.status.in_([InventoryStatus.AVAILABLE, InventoryStatus.RESERVED]))

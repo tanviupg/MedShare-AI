@@ -8,6 +8,8 @@ from app.db.database import get_db
 from app.models import ClinicProfile, ClinicVerificationStatus, User, UserRole
 from app.schemas.auth import AuthResponse, LoginRequest, SignupRequest, UserResponse
 from app.services.security import create_access_token, hash_password, verify_password
+from app.models import NotificationType
+from app.services.notifications import notify_admins
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
@@ -27,6 +29,9 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> AuthRespons
         user.clinic_profile = ClinicProfile(clinic_name=profile.clinic_name.strip(), address=profile.address.strip(), city=profile.city.strip(), license_number=profile.license_number, contact_number=profile.contact_number, verification_status=ClinicVerificationStatus.PENDING)
     db.add(user)
     try:
+        db.flush()
+        if payload.clinic_profile:
+            notify_admins(db, NotificationType.CLINIC_VERIFICATION_REQUESTED, "Clinic verification requested", "A clinic profile is waiting for review.", "clinic_profile", user.clinic_profile.id)
         db.commit()
     except IntegrityError as exc:
         db.rollback()

@@ -14,6 +14,7 @@ from app.api.routes.notifications import router as notifications_router
 from app.api.routes.checkout import router as checkout_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.clinic_verification import router as clinic_verification_router
+from app.api.routes.admin_dashboard import router as admin_dashboard_router
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name)
@@ -42,6 +43,7 @@ app.include_router(notifications_router)
 app.include_router(checkout_router)
 app.include_router(dashboard_router)
 app.include_router(clinic_verification_router)
+app.include_router(admin_dashboard_router)
 
 
 @app.get("/health", tags=["health"])

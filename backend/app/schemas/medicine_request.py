@@ -49,6 +49,7 @@ class MedicineRequestPatientResponse(BaseModel):
 
 
 class MedicineRequestPharmacistResponse(MedicineRequestPatientResponse):
+    strength: str | None
     patient_name: str
     patient_city: str | None
     patient_phone: str | None

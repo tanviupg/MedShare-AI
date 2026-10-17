@@ -4,12 +4,25 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.waste import WasteReason, WasteStatus
+from app.schemas.donation import DonationVerifiedDetails
+from pydantic import model_validator
 
 
 class WasteCreate(BaseModel):
     reason: WasteReason
     quantity: int = Field(gt=0)
     notes: str | None = Field(default=None, max_length=2000)
+
+
+class RejectedDonationVerification(BaseModel):
+    physical_package_checked: bool
+    verified_details: DonationVerifiedDetails
+
+    @model_validator(mode="after")
+    def require_physical_check(self):
+        if not self.physical_package_checked:
+            raise ValueError("Confirm the medicine was checked against the physical package")
+        return self
 
 
 class WasteResponse(BaseModel):
@@ -33,9 +46,11 @@ class WasteResponse(BaseModel):
     medicine_name: str | None = None
     strength: str | None = None
     unit: str | None = None
+    expiry_date: date | None = None
 
 
 class WasteEvent(BaseModel):
+    confirmed: bool = False
     reference: str | None = Field(default=None, max_length=120)
     notes: str | None = Field(default=None, max_length=2000)
 

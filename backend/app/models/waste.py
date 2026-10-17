@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, func
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -27,6 +27,8 @@ class WasteRecord(Base):
         CheckConstraint("(inventory_id IS NOT NULL AND donation_id IS NULL) OR (inventory_id IS NULL AND donation_id IS NOT NULL)", name="ck_waste_single_source"),
         UniqueConstraint("disposal_reference", name="uq_waste_records_disposal_reference"),
         Index("ix_waste_records_disposal_reference", "disposal_reference"),
+        Index("uq_waste_records_donation_id", "donation_id", unique=True,
+              postgresql_where=text("donation_id IS NOT NULL"), sqlite_where=text("donation_id IS NOT NULL")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

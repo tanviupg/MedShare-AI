@@ -11,6 +11,7 @@ from app.models import Checkout, ClinicProfile, DispensingRecord, Inventory, Inv
 from app.schemas.dispensing import PatientDispensingResponse, PharmacistDispensingResponse
 from app.models import NotificationType
 from app.services.notifications import notify
+from app.services.business_time import business_today
 
 pharmacist_router = APIRouter(prefix="/pharmacist", tags=["pharmacist dispensing"])
 patient_router = APIRouter(prefix="/patient", tags=["patient dispensing"])
@@ -80,7 +81,7 @@ def dispense_request(request_id: UUID, db: Session = Depends(get_db), pharmacist
         payment = db.scalar(select(Checkout).where(Checkout.request_id == row.id).with_for_update())
         if payment is None or payment.payment_status != PaymentStatus.PAID:
             raise HTTPException(status_code=409, detail="Payment must be completed before dispensing")
-    if inventory.status == InventoryStatus.EXPIRED or inventory.expiry_date < date.today():
+    if inventory.status == InventoryStatus.EXPIRED or inventory.expiry_date < business_today():
         raise HTTPException(status_code=409, detail="Expired inventory cannot be dispensed")
     if row.requested_quantity <= 0 or row.pickup_code is None:
         raise HTTPException(status_code=409, detail="This request has no valid reserved quantity")

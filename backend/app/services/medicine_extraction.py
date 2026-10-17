@@ -12,10 +12,11 @@ FIELDS = ("medicine_name", "strength", "dosage_form", "manufacturer", "batch_num
 MIN_FIELD_CONFIDENCE = 0.6
 MIN_NAME_CONFIDENCE = 0.85
 
-GEMINI_EXTRACTION_PROMPT = """You are extracting information visible in a medicine package/strip image.
+GEMINI_EXTRACTION_PROMPT = """You are extracting information visible in a medicine package/strip or doctor's prescription image.
 ONLY return information that is actually visible/readable in the supplied image.
 Do NOT guess. Do NOT infer missing information. Do NOT use medical knowledge to fill gaps.
-Do NOT invent medicine names, strengths, manufacturers, batches, expiry dates, or quantities.
+Do NOT invent medicine names, strengths, dosage forms, manufacturers, batches, expiry dates, or quantities.
+For prescriptions, extract the prescribed medicine name, strength, and dosage form only when clearly readable.
 If a field cannot be confidently read from the image, return null.
 Do not diagnose a disease or recommend treatment.
 Return only the requested structured JSON."""
@@ -94,6 +95,10 @@ class PaddleOCRExtractionProvider:
         if recognized_confidence and overall > 0:
             overall = round(min(overall, sum(recognized_confidence) / len(recognized_confidence)), 3)
         fields["raw_ocr_text"] = raw_text
+        fields["raw_ocr_confidence"] = (
+            round(sum(recognized_confidence) / len(recognized_confidence), 3)
+            if recognized_confidence else 0.0
+        )
         return ExtractionResult(fields, confidence, overall, self.name, self.version)
 
 

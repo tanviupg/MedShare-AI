@@ -15,3 +15,5 @@ dist/
 .vscode/
 
 backend/uploads/
+# Local source archive
+/frontend/src.zip

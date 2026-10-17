@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     medicine_extraction_provider: str = "gemini"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    prescription_image_classifier_enabled: bool = True
+    prescription_image_classifier_model_path: str = "models/clip-vit-base-patch32"
+    prescription_image_classifier_min_confidence: float = 0.75
+    prescription_image_classifier_min_margin: float = 0.20
     cors_allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

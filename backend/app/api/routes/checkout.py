@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
@@ -10,6 +10,7 @@ from app.api.dependencies import require_role
 from app.db.database import get_db
 from app.models import Checkout, ClinicProfile, Inventory, InventoryStatus, MedicineRequest, MedicineRequestStatus, PaymentStatus, Prescription, PrescriptionStatus, User, UserRole
 from app.schemas.checkout import CheckoutResponse
+from app.services.business_time import business_today
 
 router = APIRouter(prefix="/patient/checkout", tags=["simulated checkout"])
 
@@ -26,7 +27,7 @@ def _owned_approved_request(db: Session, request_id: UUID, patient: User, lock: 
     inventory = db.scalar(select(Inventory).where(Inventory.id == request.inventory_id).with_for_update() if lock else select(Inventory).where(Inventory.id == request.inventory_id))
     if inventory is None:
         raise HTTPException(status_code=409, detail="Reserved medicine is unavailable")
-    if inventory.expiry_date < date.today() or inventory.status == InventoryStatus.EXPIRED:
+    if inventory.expiry_date < business_today() or inventory.status == InventoryStatus.EXPIRED:
         raise HTTPException(status_code=409, detail="Expired medicine cannot proceed to checkout")
     if inventory.prescription_required is None:
         raise HTTPException(status_code=409, detail="Prescription requirement is not classified")

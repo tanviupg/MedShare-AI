@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -11,10 +11,44 @@ from app.models import ClinicProfile, ClinicVerificationStatus, User, UserRole
 from app.schemas.clinic_verification import (
     ClinicVerificationRejection,
     ClinicVerificationResult,
+    ClinicVerificationHistoryItem,
     PendingClinicVerification,
 )
 
 router = APIRouter(prefix="/admin/clinic-verifications", tags=["clinic verification"])
+
+
+@router.get("/history", response_model=list[ClinicVerificationHistoryItem])
+def list_clinic_verifications(
+    status: ClinicVerificationStatus | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_role(UserRole.ADMIN)),
+) -> list[ClinicVerificationHistoryItem]:
+    """List current verification state and latest decision metadata (not every past change)."""
+    stmt = (
+        select(ClinicProfile, User.name)
+        .outerjoin(User, ClinicProfile.verification_reviewer_id == User.id)
+        .order_by(ClinicProfile.created_at.desc(), ClinicProfile.id)
+    )
+    if status is not None:
+        stmt = stmt.where(ClinicProfile.verification_status == status)
+    rows = db.execute(stmt).all()
+    return [
+        ClinicVerificationHistoryItem(
+            id=profile.id,
+            clinic_name=profile.clinic_name,
+            address=profile.address,
+            city=profile.city,
+            license_number=profile.license_number,
+            contact_number=profile.contact_number,
+            created_at=profile.created_at,
+            verification_status=profile.verification_status,
+            verification_decided_at=profile.verification_decided_at,
+            reviewer_name=reviewer_name,
+            verification_rejection_reason=profile.verification_rejection_reason,
+        )
+        for profile, reviewer_name in rows
+    ]
 
 
 @router.get("/pending", response_model=list[PendingClinicVerification])

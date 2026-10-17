@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { API_BASE_URL } from './config'
+import { safeApiErrorMessage } from './apiErrors.mjs'
 
 type DispensingItem = { request_id: string; medicine_name: string; strength: string | null; dosage_form: string | null; clinic_name: string; quantity: number; unit: string; pickup_code: string; status: string; requested_at: string; dispensed_at: string | null; patient_name: string; patient_city: string | null; patient_phone: string | null; prescription_required: boolean | null; prescription_status: string | null }
 
@@ -11,7 +12,7 @@ export default function PharmacistDispensing({ token }: { token: string }) {
     try {
       const response = await fetch(`${API_BASE_URL}/pharmacist/dispensing`, { headers: { Authorization: `Bearer ${token}` } })
       const data = await response.json() as DispensingItem[] & { detail?: string }
-      if (!response.ok) throw new Error(data.detail ?? 'Could not load pickup requests.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not load pickup requests.'))
       setItems(data); setError('')
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not load pickup requests.') }
   }, [token])
@@ -23,7 +24,7 @@ export default function PharmacistDispensing({ token }: { token: string }) {
     try {
       const response = await fetch(`${API_BASE_URL}/pharmacist/requests/${item.request_id}/dispense`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } })
       const data = await response.json() as DispensingItem & { detail?: string }
-      if (!response.ok) throw new Error(data.detail ?? 'Could not record dispensing.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not record dispensing.'))
       setItems((current) => current.filter((row) => row.request_id !== item.request_id))
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not record dispensing.') }
     finally { setBusy('') }

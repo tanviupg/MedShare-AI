@@ -13,6 +13,7 @@ from app.db.database import get_db
 from app.models import Inventory, MedicineRequest, Prescription, PrescriptionStatus, User, UserRole
 from app.schemas.medicine_request import MedicineRequestCreate, MedicineRequestPatientResponse
 from app.services.prescription_storage import storage, store_upload
+from app.services.prescription_matching import extract_and_match_prescription
 from app.models import NotificationType
 from app.services.notifications import notify
 
@@ -27,8 +28,22 @@ def _latest(db: Session, request_id: UUID) -> Prescription | None:
 def _metadata(record: Prescription) -> dict:
     return {"id": record.id, "original_filename": record.original_filename, "content_type": record.content_type,
             "size_bytes": record.size_bytes, "status": record.status, "rejection_reason": record.rejection_reason,
+            "extracted_medicine_name": record.extracted_medicine_name,
+            "extracted_strength": record.extracted_strength,
+            "extracted_dosage_form": record.extracted_dosage_form,
+            "extraction_confidence": record.extraction_confidence,
+            "medicine_match": record.medicine_match,
             "created_at": record.created_at, "reviewed_at": record.reviewed_at,
             "file_url": None}
+
+
+def _populate_extraction(record: Prescription, inventory: Inventory, key: str, content_type: str) -> None:
+    details = extract_and_match_prescription(storage.read(key), content_type, inventory.medicine_name, inventory.strength)
+    record.extracted_medicine_name = details["medicine_name"]
+    record.extracted_strength = details["strength"]
+    record.extracted_dosage_form = details["dosage_form"]
+    record.extraction_confidence = details["confidence"]
+    record.medicine_match = details["matching_result"]
 
 
 def _patient_request(request_id: UUID, patient: User, db: Session) -> tuple[MedicineRequest, Inventory]:
@@ -58,6 +73,7 @@ async def upload_prescription(request_id: UUID, file: UploadFile = File(...), db
     key, filename, content_type, size_bytes = await store_upload(file)
     try:
         record = Prescription(request_id=row.id, storage_key=key, original_filename=filename, content_type=content_type, size_bytes=size_bytes)
+        _populate_extraction(record, inventory, key, content_type)
         db.add(record)
         db.flush()
         notify(db, inventory.pharmacist_id, NotificationType.PRESCRIPTION_AWAITING_VERIFICATION,
@@ -99,6 +115,7 @@ async def create_request_with_prescription(
             content_type=content_type,
             size_bytes=size_bytes,
         )
+        _populate_extraction(record, inventory, key, content_type)
         db.add(record)
         db.flush()
         notify(db, inventory.pharmacist_id, NotificationType.PRESCRIPTION_AWAITING_VERIFICATION,

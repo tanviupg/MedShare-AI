@@ -4,34 +4,31 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import require_role
 from app.core.config import get_settings
 from app.db.database import get_db
-from app.models import Donation, DonationReview, DonationStatus, Inventory, InventoryStatus, User, UserRole, WasteRecord, WasteReason, WasteStatus
-from app.schemas.waste import ExpiryInventoryResponse, WasteCreate, WasteEvent, WasteResponse
+from app.models import ClinicProfile, ClinicVerificationStatus, Donation, DonationImage, DonationReview, DonationStatus, Inventory, InventoryStatus, User, UserRole, WasteRecord, WasteReason, WasteStatus
+from app.schemas.waste import ExpiryInventoryResponse, RejectedDonationVerification, WasteCreate, WasteEvent, WasteResponse
 from app.models import NotificationType
 from app.services.notifications import notify
+from app.services.business_time import business_today
 
 router = APIRouter(prefix="/pharmacist", tags=["pharmacist expiry and waste"])
 
 
-def expire_inventory_records(db: Session, today: date | None = None) -> int:
+def expire_inventory_records(db: Session, pharmacist_id: UUID, today: date | None = None) -> int:
     """Synchronize expiry status while retaining inventory and quantity history."""
-    today = today or date.today()
+    today = today or business_today()
     changed_rows = db.scalars(select(Inventory).where(
+        Inventory.pharmacist_id == pharmacist_id,
         Inventory.expiry_date < today,
         Inventory.status.in_([InventoryStatus.AVAILABLE, InventoryStatus.RESERVED]),
     ).with_for_update()).all()
     for item in changed_rows:
         item.status = InventoryStatus.EXPIRED
-        notify(db, item.pharmacist_id, NotificationType.MEDICINE_EXPIRED, "Medicine expired", f"{item.medicine_name} has passed its expiry date.", "inventory", item.id)
-    soon = db.scalars(select(Inventory).where(
-        Inventory.expiry_date >= today, Inventory.expiry_date <= today + timedelta(days=get_settings().expiry_warning_days),
-        Inventory.status == InventoryStatus.AVAILABLE, Inventory.quantity_available > 0).with_for_update()).all()
-    for item in soon:
-        notify(db, item.pharmacist_id, NotificationType.MEDICINE_EXPIRING_SOON, "Medicine expiring soon", f"{item.medicine_name} has stock approaching its expiry date.", "inventory", item.id)
     changed = len(changed_rows)
     db.commit()
     return changed
@@ -42,11 +39,18 @@ def _waste_payload(db: Session, row: WasteRecord) -> dict:
     return {**{c.name: getattr(row, c.name) for c in WasteRecord.__table__.columns},
             "medicine_name": source.medicine_name if source else None,
             "strength": source.strength if source else None,
-            "unit": source.unit if source else None}
+            "unit": source.unit if source else None,
+            "expiry_date": source.expiry_date if source else None}
 
 
 def _reference() -> str:
     return f"MW-{secrets.token_hex(3).upper()}"
+
+
+def _require_verified_clinic(db: Session, pharmacist: User) -> None:
+    profile = db.scalar(select(ClinicProfile).where(ClinicProfile.user_id == pharmacist.id))
+    if profile is None or profile.verification_status != ClinicVerificationStatus.VERIFIED:
+        raise HTTPException(status_code=403, detail="A verified clinic is required to access inventory and waste records")
 
 
 def _new_record(**kwargs) -> WasteRecord:
@@ -54,10 +58,10 @@ def _new_record(**kwargs) -> WasteRecord:
 
 
 def _inventory_lists(db: Session, pharmacist: User, expiring: bool):
-    today = date.today()
+    today = business_today()
     stmt = select(Inventory).where(Inventory.pharmacist_id == pharmacist.id, Inventory.quantity_available > 0)
     if expiring:
-        stmt = stmt.where(Inventory.expiry_date > today, Inventory.expiry_date <= today + timedelta(days=get_settings().expiry_warning_days), Inventory.status == InventoryStatus.AVAILABLE)
+        stmt = stmt.where(Inventory.expiry_date >= today, Inventory.expiry_date <= today + timedelta(days=get_settings().expiry_warning_days), Inventory.status == InventoryStatus.AVAILABLE)
     else:
         stmt = stmt.where(Inventory.expiry_date < today, Inventory.status == InventoryStatus.EXPIRED)
     items = db.scalars(stmt.order_by(Inventory.expiry_date)).all()
@@ -68,22 +72,25 @@ def _inventory_lists(db: Session, pharmacist: User, expiring: bool):
 
 @router.get("/inventory/expiring", response_model=list[ExpiryInventoryResponse])
 def expiring_inventory(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
     return _inventory_lists(db, pharmacist, True)
 
 
 @router.get("/inventory/expired", response_model=list[ExpiryInventoryResponse])
 def expired_inventory(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
-    expire_inventory_records(db)
+    _require_verified_clinic(db, pharmacist)
+    expire_inventory_records(db, pharmacist.id)
     return _inventory_lists(db, pharmacist, False)
 
 
 @router.post("/inventory/{inventory_id}/waste", response_model=WasteResponse, status_code=201)
 def move_inventory_to_waste(inventory_id: UUID, body: WasteCreate, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
     try:
         item = db.scalar(select(Inventory).where(Inventory.id == inventory_id).with_for_update())
         if item is None or item.pharmacist_id != pharmacist.id:
             raise HTTPException(status_code=404, detail="Inventory record not found")
-        today = date.today()
+        today = business_today()
         if item.expiry_date < today and item.status in (InventoryStatus.AVAILABLE, InventoryStatus.RESERVED):
             item.status = InventoryStatus.EXPIRED
         if item.status in (InventoryStatus.DEPLETED, InventoryStatus.REMOVED) or item.quantity_available <= 0:
@@ -107,46 +114,101 @@ def move_inventory_to_waste(inventory_id: UUID, body: WasteCreate, db: Session =
 
 @router.get("/donations/rejected-for-disposal")
 def rejected_for_disposal(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
-    recorded = select(func.coalesce(func.sum(WasteRecord.quantity), 0)).where(WasteRecord.donation_id == Donation.id).scalar_subquery()
-    donations = db.scalars(select(Donation).join(DonationReview, DonationReview.donation_id == Donation.id).where(
-        Donation.status == DonationStatus.REJECTED, DonationReview.pharmacist_id == pharmacist.id,
-        recorded < Donation.quantity
+    _require_verified_clinic(db, pharmacist)
+    rows = db.execute(select(Donation, DonationReview).join(
+        DonationReview, DonationReview.donation_id == Donation.id
+    ).where(
+        Donation.status == DonationStatus.REJECTED,
+        DonationReview.pharmacist_id == pharmacist.id,
+        ~select(WasteRecord.id).where(WasteRecord.donation_id == Donation.id).exists(),
     ).order_by(Donation.updated_at.desc())).all()
-    return [{"id": d.id, "medicine_name": d.medicine_name, "strength": d.strength,
-             "quantity": d.quantity - (db.scalar(select(func.coalesce(func.sum(WasteRecord.quantity), 0)).where(WasteRecord.donation_id == d.id)) or 0),
-             "unit": d.unit, "created_at": d.created_at} for d in donations]
+    return [{"id": donation.id, "medicine_name": donation.medicine_name, "strength": donation.strength,
+             "quantity": donation.quantity, "quantity_verified": review.verified_details is not None,
+             "unit": donation.unit, "expiry_date": donation.expiry_date,
+             "created_at": donation.created_at} for donation, review in rows]
 
 
 @router.post("/donations/{donation_id}/waste", response_model=WasteResponse, status_code=201)
 def rejected_donation_to_waste(donation_id: UUID, body: WasteCreate, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
     donation = db.scalar(select(Donation).where(Donation.id == donation_id).with_for_update())
     review = db.scalar(select(DonationReview).where(DonationReview.donation_id == donation_id))
     if donation is None or donation.status != DonationStatus.REJECTED or review is None or review.pharmacist_id != pharmacist.id:
         raise HTTPException(status_code=404, detail="Rejected donation not found")
     if body.reason != WasteReason.REJECTED_DONATION:
         raise HTTPException(status_code=422, detail="Rejected donations must use REJECTED_DONATION reason")
-    if donation.quantity is None:
-        raise HTTPException(status_code=409, detail="A pharmacist-verified donation quantity is required before waste can be recorded")
+    if (review.verified_details is None or donation.quantity is None or not donation.medicine_name
+            or not donation.unit or donation.expiry_date is None):
+        raise HTTPException(status_code=409, detail="Pharmacist-verified medicine details and quantity are required before waste can be recorded")
+    existing = db.scalar(select(WasteRecord.id).where(WasteRecord.donation_id == donation.id))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Waste has already been recorded for this rejected donation")
     already_recorded = db.scalar(select(func.coalesce(func.sum(WasteRecord.quantity), 0)).where(WasteRecord.donation_id == donation.id)) or 0
     if body.quantity > donation.quantity - already_recorded:
         raise HTTPException(status_code=409, detail="Waste quantity exceeds unrecorded donation quantity")
     row = _new_record(donation_id=donation.id, pharmacist_id=pharmacist.id, reason=body.reason, quantity=body.quantity, notes=body.notes)
-    db.add(row)
-    db.flush()
-    notify(db, pharmacist.id, NotificationType.WASTE_DISPOSAL_PENDING, "Waste disposal pending", "A waste record is awaiting disposal.", "waste_record", row.id)
-    db.commit()
-    db.refresh(row)
+    try:
+        db.add(row)
+        db.flush()
+        notify(db, pharmacist.id, NotificationType.WASTE_DISPOSAL_PENDING, "Waste disposal pending", "A waste record is awaiting disposal.", "waste_record", row.id)
+        db.commit()
+        db.refresh(row)
+    except IntegrityError as exc:
+        db.rollback()
+        if db.scalar(select(WasteRecord.id).where(WasteRecord.donation_id == donation.id)) is not None:
+            raise HTTPException(status_code=409, detail="Waste has already been recorded for this rejected donation") from exc
+        raise
     return _waste_payload(db, row)
+
+
+@router.get("/donations/{donation_id}/verification")
+def rejected_donation_verification_details(donation_id: UUID, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
+    row = db.execute(select(Donation, DonationReview).join(DonationReview, DonationReview.donation_id == Donation.id).where(
+        Donation.id == donation_id, Donation.status == DonationStatus.REJECTED, DonationReview.pharmacist_id == pharmacist.id
+    )).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Rejected donation not found")
+    donation, review = row
+    images = db.scalars(select(DonationImage).where(DonationImage.donation_id == donation.id).order_by(DonationImage.created_at)).all()
+    return {"id": donation.id, "medicine_name": donation.medicine_name, "strength": donation.strength,
+        "dosage_form": donation.dosage_form, "packaging_type": donation.packaging_type, "manufacturer": donation.manufacturer,
+        "batch_number": donation.batch_number, "expiry_date": donation.expiry_date, "quantity": donation.quantity,
+        "unit": donation.unit, "verified_details": review.verified_details,
+        "images": [{"id": image.id, "download_url": f"/donations/{donation.id}/images/{image.id}"} for image in images]}
+
+
+@router.post("/donations/{donation_id}/verification")
+def verify_rejected_donation(donation_id: UUID, body: RejectedDonationVerification, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
+    row = db.execute(select(Donation, DonationReview).join(DonationReview, DonationReview.donation_id == Donation.id).where(
+        Donation.id == donation_id, Donation.status == DonationStatus.REJECTED, DonationReview.pharmacist_id == pharmacist.id
+    ).with_for_update()).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Rejected donation not found")
+    donation, review = row
+    verified = body.verified_details
+    for key, value in verified.model_dump(exclude={"common_use_category"}).items():
+        setattr(donation, key, value)
+    review.verified_details = {**verified.model_dump(mode="json"), "verified_by": str(pharmacist.id),
+        "verified_at": datetime.now(timezone.utc).isoformat()}
+    review.physical_package_checked = True
+    review.reviewed_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"id": donation.id, "quantity": donation.quantity, "unit": donation.unit, "expiry_date": donation.expiry_date,
+        "medicine_name": donation.medicine_name, "quantity_verified": True}
 
 
 @router.get("/waste", response_model=list[WasteResponse])
 def list_waste(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
     rows = db.scalars(select(WasteRecord).where(WasteRecord.pharmacist_id == pharmacist.id).order_by(WasteRecord.created_at.desc())).all()
     return [_waste_payload(db, row) for row in rows]
 
 
 @router.get("/waste/{waste_id}", response_model=WasteResponse)
 def get_waste(waste_id: UUID, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
     row = db.scalar(select(WasteRecord).where(WasteRecord.id == waste_id, WasteRecord.pharmacist_id == pharmacist.id))
     if row is None:
         raise HTTPException(status_code=404, detail="Waste record not found")
@@ -154,6 +216,9 @@ def get_waste(waste_id: UUID, db: Session = Depends(get_db), pharmacist: User = 
 
 
 def _transition(waste_id: UUID, target: WasteStatus, db: Session, pharmacist: User, event: WasteEvent):
+    _require_verified_clinic(db, pharmacist)
+    if not event.confirmed:
+        raise HTTPException(status_code=422, detail="Explicit confirmation is required to record collection or disposal")
     row = db.scalar(select(WasteRecord).where(WasteRecord.id == waste_id).with_for_update())
     if row is None or row.pharmacist_id != pharmacist.id:
         raise HTTPException(status_code=404, detail="Waste record not found")

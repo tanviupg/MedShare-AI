@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ArrowLeft, Heart, LogOut, Plus, ShieldCheck, Upload } from 'lucide-react'
 import { API_BASE_URL } from './config'
@@ -12,6 +12,8 @@ import PharmacistDispensing from './PharmacistDispensing'
 import Notifications from './Notifications'
 import PharmacistDashboard from './PharmacistDashboard'
 import AdminClinicVerification from './AdminClinicVerification'
+import AdminDashboard from './AdminDashboard'
+import { safeApiErrorMessage } from './apiErrors.mjs'
 
 type Role = 'DONOR' | 'PATIENT' | 'CLINIC_PHARMACIST' | 'ADMIN'
 type SignupRole = Exclude<Role, 'ADMIN'>
@@ -20,6 +22,7 @@ type AuthResult = { access_token: string; user: User }
 type DonationStatus = 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' | 'CANCELLED'
 type Donation = { id: string; status: DonationStatus; created_at: string }
 type ClinicTab = 'Overview' | 'Donations' | 'Inventory' | 'Patient Requests' | 'Prescriptions' | 'Waste Management' | 'Notifications'
+type AdminTab = 'Dashboard' | 'Clinic Verification'
 const clinicTabs: ClinicTab[] = ['Overview', 'Donations', 'Inventory', 'Patient Requests', 'Prescriptions', 'Waste Management', 'Notifications']
 
 const roleLabels: Record<Role, string> = { DONOR: 'Donor', PATIENT: 'Patient', CLINIC_PHARMACIST: 'Clinic / Pharmacist', ADMIN: 'Platform administrator' }
@@ -41,6 +44,7 @@ function App() {
   const [donationBusy, setDonationBusy] = useState(false)
   const [operationsRevision, setOperationsRevision] = useState(0)
   const [clinicTab, setClinicTab] = useState<ClinicTab>('Overview')
+  const [adminTab, setAdminTab] = useState<AdminTab>('Dashboard')
 
   useEffect(() => {
     if (!token) return
@@ -78,7 +82,7 @@ function App() {
     try {
       const response = await fetch(`${API_BASE_URL}/auth/${mode}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       const result = await response.json() as AuthResult & { detail?: string }
-      if (!response.ok) throw new Error(result.detail ?? 'Authentication failed')
+      if (!response.ok) throw new Error(safeApiErrorMessage(result, 'Authentication failed'))
       localStorage.setItem('medshare_token', result.access_token)
       setToken(result.access_token)
       setUser(result.user)
@@ -94,6 +98,7 @@ function App() {
     setView('list')
     setDonations([])
     setClinicTab('Overview')
+    setAdminTab('Dashboard')
   }
 
   async function submitDonation(event: FormEvent<HTMLFormElement>) {
@@ -108,7 +113,7 @@ function App() {
       const payload = { pickup_address: form.get('pickup_address'), donor_expiry_date: form.get('donor_expiry_date') || null }
       const response = await fetch(`${API_BASE_URL}/donations`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       const donation = await response.json() as Donation & { detail?: string }
-      if (!response.ok) throw new Error(donation.detail ?? 'Could not submit donation.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(donation, 'Could not submit donation.'))
       const images = new FormData()
       files.forEach((file) => images.append('files', file))
       const upload = await fetch(`${API_BASE_URL}/donations/${donation.id}/images`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: images })
@@ -158,7 +163,7 @@ function App() {
             <div id="clinic-panel-4" role="tabpanel" aria-labelledby="clinic-tab-4" hidden={clinicTab !== 'Prescriptions'}><PharmacistPrescriptions token={token} /></div>
             <div id="clinic-panel-5" role="tabpanel" aria-labelledby="clinic-tab-5" hidden={clinicTab !== 'Waste Management'}><PharmacistExpiryWaste token={token} /></div>
             <div id="clinic-panel-6" role="tabpanel" aria-labelledby="clinic-tab-6" hidden={clinicTab !== 'Notifications'}><Notifications token={token} standalone /></div>
-          </> : user.role === 'ADMIN' && token ? <><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ea] pb-3"><p className="text-sm text-[#718078]">Signed in as <b className="text-[#18372e]">{user.name}</b> · {roleLabels[user.role]}</p><button onClick={logout} className="rounded-full px-3 py-2 text-sm font-medium text-[#718078] hover:bg-[#f5f7f2]">Log out</button></div><AdminClinicVerification token={token} /></> : user.role === 'DONOR' ? <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}<DonorDashboard donations={donations} view={view} setView={setView} error={donationError} busy={donationBusy} onSubmit={submitDonation} onLogout={logout} /></> : <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}{token ? <PatientDiscovery token={token} onLogout={logout} /> : null}</>}
+          </> : user.role === 'ADMIN' && token ? <><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ea] pb-3"><p className="text-sm text-[#718078]">Signed in as <b className="text-[#18372e]">{user.name}</b> · {roleLabels[user.role]}</p><button onClick={logout} className="rounded-full px-3 py-2 text-sm font-medium text-[#718078] hover:bg-[#f5f7f2]">Log out</button></div><div className="mt-4 flex justify-end"><Notifications token={token} /></div><><nav aria-label="Admin sections" className="mt-4 flex flex-wrap gap-2 border-b border-[#edf0ea] pb-3"><button type="button" aria-current={adminTab === "Dashboard" ? "page" : undefined} onClick={() => setAdminTab("Dashboard")} className={adminTab === "Dashboard" ? "rounded-full bg-[#e7efe2] px-4 py-2 text-sm font-semibold text-[#174e3f]" : "rounded-full px-4 py-2 text-sm font-semibold text-[#718078]"}>Dashboard</button><button type="button" aria-current={adminTab === "Clinic Verification" ? "page" : undefined} onClick={() => setAdminTab("Clinic Verification")} className={adminTab === "Clinic Verification" ? "rounded-full bg-[#e7efe2] px-4 py-2 text-sm font-semibold text-[#174e3f]" : "rounded-full px-4 py-2 text-sm font-semibold text-[#718078]"}>Clinic Verification</button></nav>{adminTab === "Dashboard" ? <AdminDashboard token={token} /> : <AdminClinicVerification token={token} />}</></> : user.role === 'DONOR' ? <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}<DonorDashboard donations={donations} view={view} setView={setView} error={donationError} busy={donationBusy} onSubmit={submitDonation} onLogout={logout} /></> : <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}{token ? <PatientDiscovery token={token} onLogout={logout} /> : null}</>}
         </div> : <>
           <h1 className="text-2xl font-semibold tracking-tight">{mode === 'signup' ? 'Join MedShare AI' : 'Welcome back'}</h1>
           <p className="mt-2 text-sm leading-6 text-[#718078]">{mode === 'signup' ? 'Create a secure account to get started.' : 'Sign in to your MedShare AI account.'}</p>

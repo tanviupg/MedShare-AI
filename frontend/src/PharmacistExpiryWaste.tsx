@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { API_BASE_URL } from './config'
+import { safeApiErrorMessage } from './apiErrors.mjs'
 
 type WasteReason = 'EXPIRED' | 'DAMAGED' | 'REJECTED_DONATION'
 type WasteStatus = 'DISPOSAL_PENDING' | 'COLLECTED' | 'DISPOSED'
@@ -10,6 +11,7 @@ type Item = {
   strength: string | null
   quantity_available?: number
   quantity?: number
+  quantity_verified?: boolean
   unit: string
   expiry_date?: string
   days_remaining?: number
@@ -30,6 +32,7 @@ type Item = {
 
 type WasteDraft = { item: Item; source: 'inventory' | 'donation'; quantity: string; reason: WasteReason; notes: string }
 type TransitionDraft = { item: Item; action: 'collect' | 'dispose'; confirmed: boolean; reference: string; notes: string }
+type Verified = { medicine_name: string; strength: string; dosage_form: string; packaging_type: string; manufacturer: string; batch_number: string; expiry_date: string; quantity: string; unit: string; common_use_category: string }
 type ApiError = { detail?: string }
 
 const paths = {
@@ -38,12 +41,13 @@ const paths = {
   waste: '/pharmacist/waste',
   rejected: '/pharmacist/donations/rejected-for-disposal',
 } as const
-type Tab = keyof typeof paths
+type Tab = keyof typeof paths | 'disposal'
 const tabs: { key: Tab; label: string }[] = [
   { key: 'expiring', label: 'Expiring Soon' },
   { key: 'expired', label: 'Expired Medicines' },
-  { key: 'waste', label: 'Waste / Disposal' },
-  { key: 'rejected', label: 'Rejected Donations' },
+  { key: 'rejected', label: 'Pending Waste' },
+  { key: 'waste', label: 'Waste' },
+  { key: 'disposal', label: 'Disposal' },
 ]
 const fieldClass = 'mt-1.5 w-full rounded-xl border border-[#dce4d9] bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-[#719a6c] focus:ring-2 focus:ring-[#719a6c]/15'
 const actionClass = 'rounded-full bg-[#174e3f] px-4 py-2 text-xs font-semibold text-white transition hover:bg-[#103d31] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#719a6c] disabled:cursor-not-allowed disabled:opacity-50'
@@ -69,17 +73,22 @@ export default function PharmacistExpiryWaste({ token }: { token: string }) {
   const [wasteDraft, setWasteDraft] = useState<WasteDraft | null>(null)
   const [transitionDraft, setTransitionDraft] = useState<TransitionDraft | null>(null)
   const [fieldError, setFieldError] = useState('')
+  const [verifyItem, setVerifyItem] = useState<Item | null>(null)
+  const [verified, setVerified] = useState<Verified | null>(null)
+  const [photoUrls, setPhotoUrls] = useState<string[]>([])
+  const [physicalChecked, setPhysicalChecked] = useState(false)
   const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
 
   useEffect(() => {
     let active = true
     setLoading(true)
     setError('')
-    fetch(`${API_BASE_URL}${paths[tab]}`, { headers: { Authorization: `Bearer ${token}` } })
+    const endpoint = tab === 'disposal' ? paths.waste : paths[tab]
+    fetch(`${API_BASE_URL}${endpoint}`, { headers: { Authorization: `Bearer ${token}` } })
       .then(async (response) => {
         const data = await response.json() as Item[] & ApiError
-        if (!response.ok) throw new Error(data.detail ?? 'Could not load waste records.')
-        if (active) setRows(data)
+        if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not load waste records.'))
+        if (active) setRows(tab === 'disposal' ? data.filter((item) => item.status !== 'DISPOSED') : data)
       })
       .catch((cause: unknown) => {
         if (active) setError(cause instanceof Error ? cause.message : 'Could not load waste records.')
@@ -114,6 +123,38 @@ export default function PharmacistExpiryWaste({ token }: { token: string }) {
     setSuccess('')
   }
 
+  async function beginVerification(item: Item) {
+    setError(''); setFieldError(''); setVerifyItem(item); setPhysicalChecked(false); setPhotoUrls([]); setVerified(null)
+    try {
+      const response = await fetch(`${API_BASE_URL}/pharmacist/donations/${item.id}/verification`, { headers: { Authorization: `Bearer ${token}` } })
+      const data = await response.json() as Record<string, any> & ApiError
+      if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not open donation details.'))
+      const source = data.verified_details ?? data
+      setVerified({ medicine_name: source.medicine_name ?? '', strength: source.strength ?? '', dosage_form: source.dosage_form ?? '', packaging_type: source.packaging_type ?? '', manufacturer: source.manufacturer ?? '', batch_number: source.batch_number ?? '', expiry_date: source.expiry_date ?? '', quantity: source.quantity == null ? '' : String(source.quantity), unit: source.unit ?? '', common_use_category: source.common_use_category ?? 'UNCLASSIFIED' })
+      const urls = await Promise.all((data.images ?? []).map(async (image: { download_url: string }) => {
+        const photo = await fetch(`${API_BASE_URL}${image.download_url}`, { headers: { Authorization: `Bearer ${token}` } })
+        return photo.ok ? URL.createObjectURL(await photo.blob()) : ''
+      }))
+      setPhotoUrls(urls.filter(Boolean))
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not open donation details.') }
+  }
+
+  async function saveVerification(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!verifyItem || !verified) return
+    const quantity = Number(verified.quantity)
+    if (!physicalChecked) { setFieldError('Confirm that you checked the information against the physical medicine.'); return }
+    if (!Number.isInteger(quantity) || quantity < 1) { setFieldError('Enter the actual whole quantity counted.'); return }
+    setBusy(true); setFieldError(''); setError('')
+    try {
+      const response = await fetch(`${API_BASE_URL}/pharmacist/donations/${verifyItem.id}/verification`, { method: 'POST', headers, body: JSON.stringify({ physical_package_checked: true, verified_details: { ...verified, quantity } }) })
+      const result = await response.json() as ApiError
+      if (!response.ok) throw new Error(safeApiErrorMessage(result, 'Could not save verification.'))
+      setVerifyItem(null); setVerified(null); setPhotoUrls([]); setSuccess('Medicine details verified. Pending Waste refreshed.'); setReload((value) => value + 1)
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save verification.') }
+    finally { setBusy(false) }
+  }
+
   async function submitWaste(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!wasteDraft) return
@@ -136,7 +177,7 @@ export default function PharmacistExpiryWaste({ token }: { token: string }) {
         body: JSON.stringify({ reason: wasteDraft.reason, quantity, notes: wasteDraft.notes.trim() || null }),
       })
       const result = await response.json() as Item & ApiError
-      if (!response.ok) throw new Error(result.detail ?? 'Could not record this waste.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(result, 'Could not record this waste.'))
       setWasteDraft(null)
       setSuccess(`Waste recorded successfully. Reference ${result.disposal_reference}; status: ${statusText[result.status as WasteStatus] ?? result.status}.`)
       setReload((value) => value + 1)
@@ -169,10 +210,10 @@ export default function PharmacistExpiryWaste({ token }: { token: string }) {
       const response = await fetch(`${API_BASE_URL}/pharmacist/waste/${item.id}/${action}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ reference: reference.trim() || null, ...(action === 'dispose' ? { notes: notes.trim() || null } : {}) }),
+        body: JSON.stringify({ confirmed: true, reference: reference.trim() || null, ...(action === 'dispose' ? { notes: notes.trim() || null } : {}) }),
       })
       const result = await response.json() as Item & ApiError
-      if (!response.ok) throw new Error(result.detail ?? `Could not mark this record ${action === 'collect' ? 'collected' : 'disposed'}.`)
+      if (!response.ok) throw new Error(safeApiErrorMessage(result, `Could not mark this record ${action === 'collect' ? 'collected' : 'disposed'}.`))
       setTransitionDraft(null)
       setSuccess(`Waste record ${action === 'collect' ? 'marked collected' : 'marked disposed'} successfully. Status: ${statusText[result.status as WasteStatus] ?? result.status}.`)
       setReload((value) => value + 1)
@@ -203,11 +244,13 @@ export default function PharmacistExpiryWaste({ token }: { token: string }) {
         <div className="min-w-0">
           <h3 className="break-words font-semibold">{item.medicine_name}{item.strength ? ` · ${item.strength}` : ''}</h3>
           <p className="mt-1 text-sm text-[#718078]">
-            {tab === 'waste' ? `${item.quantity} ${item.unit} recorded` : `${item.quantity_available ?? item.quantity} ${item.unit} available`}
+            {tab === 'waste' || tab === 'disposal' ? `${item.quantity} ${item.unit} recorded` : tab === 'rejected'
+              ? item.quantity_verified ? `${item.quantity} ${item.unit} verified` : 'Details and quantity need verification'
+              : `${item.quantity_available ?? item.quantity} ${item.unit} available`}
             {item.expiry_date && ` · Expires ${new Date(`${item.expiry_date}T00:00:00`).toLocaleDateString()}`}
           </p>
           {item.days_remaining !== undefined && <p className="mt-1 text-xs text-[#87938a]">{item.days_remaining} days remaining</p>}
-          {tab === 'waste' && <>
+          {(tab === 'waste' || tab === 'disposal') && <>
             <p className="mt-1 text-sm text-[#52645b]">Reason: {item.reason?.replaceAll('_', ' ') ?? 'Not recorded'} · Reference: {item.disposal_reference ?? 'Not recorded'}</p>
             <p className="mt-1 text-xs text-[#718078]">Recorded {displayDate(item.created_at)} · Collected {displayDate(item.collected_at)} · Disposed {displayDate(item.disposed_at)}</p>
             {(item.collected_by || item.disposed_by) && <p className="mt-1 break-all text-xs text-[#718078]">{item.collected_by && `Collected by staff ${item.collected_by}`}{item.collected_by && item.disposed_by ? ' · ' : ''}{item.disposed_by && `Disposed by staff ${item.disposed_by}`}</p>}
@@ -228,14 +271,26 @@ export default function PharmacistExpiryWaste({ token }: { token: string }) {
           : <button type="button" disabled={busy} onClick={() => beginWasteEntry(item, 'inventory')} className={actionClass}>Record Waste</button>}
       </div>}
       {tab === 'rejected' && <div className="mt-3">
+        {verifyItem?.id === item.id && verified ? <form onSubmit={saveVerification} className="space-y-3 rounded-xl bg-[#f7f8f5] p-4">
+          <h4 className="font-semibold">Verify against the physical medicine</h4>
+          {photoUrls.length > 0 && <div className="flex flex-wrap gap-2">{photoUrls.map((url, i) => <a key={url} href={url} target="_blank" rel="noreferrer"><img src={url} alt={`Protected donation photo ${i + 1}`} className="size-24 rounded-lg border object-contain" /></a>)}</div>}
+          <div className="grid gap-3 sm:grid-cols-2">{([['medicine_name','Medicine name','text'],['strength','Strength','text'],['dosage_form','Form','text'],['packaging_type','Packaging condition / type','text'],['manufacturer','Manufacturer','text'],['batch_number','Batch number','text'],['expiry_date','Expiry date','date'],['quantity','Actual available quantity','number'],['unit','Quantity unit','text']] as const).map(([key,label,type]) => <label key={key} className="text-sm font-medium">{label}<input required={['medicine_name','expiry_date','quantity','unit'].includes(key)} className={fieldClass} type={type} min={type === 'number' ? '1' : undefined} step={type === 'number' ? '1' : undefined} value={verified[key]} onChange={(event) => setVerified({ ...verified, [key]: event.target.value })} /></label>)}</div>
+          <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={physicalChecked} onChange={(event) => setPhysicalChecked(event.target.checked)} /><span>I checked these details and counted this quantity against the physical medicine.</span></label>
+          {fieldError && <p role="alert" className="text-sm text-red-700">{fieldError}</p>}
+          <button type="submit" disabled={busy || !physicalChecked} className={actionClass}>{busy ? 'Saving...' : 'Save Verification'}</button><button type="button" onClick={() => setVerifyItem(null)} className={secondaryClass}>Cancel</button>
+        </form> : <>
+        {!item.quantity_verified && <button type="button" disabled={busy} onClick={() => void beginVerification(item)} className={`${secondaryClass} mr-2`}>Verify Details</button>}
         {startForm(item) ? <WasteEntryForm draft={wasteDraft!} busy={busy} fieldError={fieldError} onChange={setWasteDraft} onCancel={() => { setWasteDraft(null); setFieldError('') }} onSubmit={submitWaste} />
-          : <button type="button" disabled={busy} onClick={() => beginWasteEntry(item, 'donation')} className={actionClass}>Record for Disposal</button>}
+          : item.quantity_verified && (item.quantity ?? 0) > 0 && item.medicine_name && item.unit && item.expiry_date
+            ? <button type="button" disabled={busy} onClick={() => beginWasteEntry(item, 'donation')} className={actionClass}>Record for Disposal</button>
+            : <p className="text-sm text-amber-800">{item.expiry_date && new Date(`${item.expiry_date}T00:00:00`) < new Date(new Date().toDateString()) ? 'Expired medicine: verify details, then record for disposal.' : 'Verify the medicine details and actual quantity to continue.'}</p>}
+        </>}
       </div>}
-      {tab === 'waste' && item.status === 'DISPOSAL_PENDING' && <div className="mt-3">
+      {(tab === 'waste' || tab === 'disposal') && item.status === 'DISPOSAL_PENDING' && <div className="mt-3">
         {startTransition(item) ? <WasteTransitionForm draft={transitionDraft!} busy={busy} fieldError={fieldError} onChange={setTransitionDraft} onCancel={() => { setTransitionDraft(null); setFieldError('') }} onSubmit={submitTransition} />
           : <button type="button" disabled={busy} onClick={() => beginTransition(item, 'collect')} className={actionClass}>Mark Collected</button>}
       </div>}
-      {tab === 'waste' && item.status === 'COLLECTED' && <div className="mt-3">
+      {(tab === 'waste' || tab === 'disposal') && item.status === 'COLLECTED' && <div className="mt-3">
         {startTransition(item) ? <WasteTransitionForm draft={transitionDraft!} busy={busy} fieldError={fieldError} onChange={setTransitionDraft} onCancel={() => { setTransitionDraft(null); setFieldError('') }} onSubmit={submitTransition} />
           : <button type="button" disabled={busy} onClick={() => beginTransition(item, 'dispose')} className={actionClass}>Mark Disposed</button>}
       </div>}

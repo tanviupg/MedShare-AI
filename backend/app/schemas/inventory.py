@@ -37,6 +37,7 @@ class InventoryResponse(BaseModel):
     batch_number: str | None
     expiry_date: date
     quantity_available: int
+    reserved_quantity: int = 0
     original_quantity: int
     original_price: Decimal | None
     discount_percentage: Decimal | None
@@ -56,3 +57,7 @@ class PrescriptionRequirementUpdate(BaseModel):
 class InventoryPricingUpdate(BaseModel):
     original_price: Decimal | None = Field(..., ge=0, max_digits=12, decimal_places=2)
     discount_percentage: Decimal | None = Field(..., ge=0, le=100, max_digits=5, decimal_places=2)
+
+
+class InventoryQuantityUpdate(BaseModel):
+    quantity_available: int = Field(..., ge=0)

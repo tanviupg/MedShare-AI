@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ArrowLeft, Check, FileImage, LogOut } from 'lucide-react'
 import { API_BASE_URL } from './config'
+import { safeApiErrorMessage } from './apiErrors.mjs'
 
 type Image = { id: string; original_filename: string; download_url: string }
 type Extraction = { fields: Record<string, string | number | null>; raw_ocr_text: string | null; confidence: Record<string, number | null>; overall_confidence: number | null; provider: string; is_mock: boolean; status: string; error_message?: string | null }
@@ -61,7 +62,7 @@ export default function PharmacistReview({ token, onLogout, onReviewComplete }: 
     const url = `${API_BASE_URL}/donations/review-queue`
     const response = await fetch(url, { headers: auth })
     const data = await response.json() as Donation[] & { detail?: string }
-    if (!response.ok) throw new Error(data.detail ?? 'Could not load the review queue.')
+    if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not load the review queue.'))
     setQueue(data)
   }
   useEffect(() => {
@@ -73,7 +74,7 @@ export default function PharmacistReview({ token, onLogout, onReviewComplete }: 
     try {
       const response = await fetch(`${API_BASE_URL}/donations/${donation.id}/review`, { headers: auth })
       const data = await response.json() as Donation & { detail?: string }
-      if (!response.ok) throw new Error(data.detail ?? 'Could not open donation.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not open donation.'))
       setSelected(data); setReason('')
       setExtractions([])
       setVerified({
@@ -112,7 +113,7 @@ export default function PharmacistReview({ token, onLogout, onReviewComplete }: 
     try {
       const response = await fetch(`${API_BASE_URL}/donations/${selected.id}/extract`, { method: 'POST', headers: auth })
       const result = await response.json() as ExtractionResponse
-      if (!response.ok) throw new Error(result.detail ?? 'Could not run OCR.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(result, 'Could not run OCR.'))
       const rows = result.items
       setExtractions(rows)
       const fields = rows.find((item) => item.status === 'COMPLETED')?.fields
@@ -153,7 +154,7 @@ export default function PharmacistReview({ token, onLogout, onReviewComplete }: 
       const attachVerifiedDetails = Boolean(verified && (decision === 'APPROVED' || (physicalChecked && hasCompleteVerifiedDetails(verified))))
       const response = await fetch(`${API_BASE_URL}/donations/${selected.id}/review`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, reason: reason.trim() || null, physical_package_checked: physicalChecked, verified_details: attachVerifiedDetails && verified ? { ...verified, quantity: Number(verified.quantity) } : null }) })
       const data = await response.json() as { detail?: string }
-      if (!response.ok) throw new Error(data.detail ?? 'Could not save review.')
+      if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not save review.'))
       setMessage(decision === 'REJECTED' ? 'Donation rejected successfully.' : 'Donation approved successfully and added to inventory.')
       setError('')
       setSelected(null)
