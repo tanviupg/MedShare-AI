@@ -1,7 +1,8 @@
 from pathlib import Path
 from uuid import UUID
+import hashlib
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Query
 from fastapi.responses import Response
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -233,13 +234,14 @@ def get_extraction(donation_id: UUID, db: Session = Depends(get_db), user: User 
 
 
 @router.post("/{donation_id}/images", response_model=list[DonationImageResponse], status_code=status.HTTP_201_CREATED)
-async def add_donation_images(donation_id: UUID, files: list[UploadFile] = File(...), db: Session = Depends(get_db), user: User = Depends(require_role(UserRole.DONOR))) -> list[DonationImageResponse]:
+async def add_donation_images(donation_id: UUID, files: list[UploadFile] = File(...), finalize: bool = Query(default=True), db: Session = Depends(get_db), user: User = Depends(require_role(UserRole.DONOR))) -> list[DonationImageResponse]:
     donation = owned_donation(donation_id, user, db)
     if donation.details_confirmed:
         raise HTTPException(status_code=409, detail="Photos cannot be changed after donation submission")
-    if not files or len(files) > 8 or len(donation.images) + len(files) > 8:
+    if not files or len(files) > 8:
         raise HTTPException(status_code=400, detail="A donation can have at most 8 images")
     saved: list[tuple[str, DonationImage]] = []
+    duplicates: list[DonationImage] = []
     try:
         for upload in files:
             content = await upload.read(MAX_IMAGE_BYTES + 1)
@@ -249,21 +251,31 @@ async def add_donation_images(donation_id: UUID, files: list[UploadFile] = File(
             content_type = upload.content_type or ""
             if kind not in IMAGE_EXTENSIONS or content_type not in ALLOWED_IMAGE_TYPES or content_type != IMAGE_CONTENT_TYPES.get(kind):
                 raise HTTPException(status_code=415, detail="Only JPEG, PNG, and WebP images are accepted")
+            digest = hashlib.sha256(content).digest()
+            duplicate = next((image for image in donation.images if hashlib.sha256(storage.read(image.storage_key)).digest() == digest), None)
+            if duplicate is not None:
+                duplicates.append(duplicate)
+                continue
+            if len(donation.images) + len(saved) >= 8:
+                raise HTTPException(status_code=400, detail="A donation can have at most 8 images")
             key = storage.save(content, IMAGE_EXTENSIONS[kind])
             original = Path(upload.filename or "image").name[:255]
             record = DonationImage(donation_id=donation.id, storage_key=key, original_filename=original, content_type=content_type, size_bytes=len(content))
             db.add(record)
             saved.append((key, record))
-        donation.details_confirmed = True
-        notify_verified_pharmacists(
-            db,
-            NotificationType.DONATION_AWAITING_REVIEW,
-            "New donation awaiting review",
-            "A donor submitted medicine photos and pickup information for clinic review.",
-            "donation",
-            donation.id,
-        )
-        notify(db, user.id, NotificationType.DONATION_SUBMITTED, "Donation submitted", "Your medicine donation was submitted for clinic review.", "donation", donation.id)
+        if finalize:
+            if not donation.images and not saved:
+                raise HTTPException(status_code=400, detail="At least one medicine photo is required")
+            donation.details_confirmed = True
+            notify_verified_pharmacists(
+                db,
+                NotificationType.DONATION_AWAITING_REVIEW,
+                "New donation awaiting review",
+                "A donor submitted medicine photos and pickup information for clinic review.",
+                "donation",
+                donation.id,
+            )
+            notify(db, user.id, NotificationType.DONATION_SUBMITTED, "Donation submitted", "Your medicine donation was submitted for clinic review.", "donation", donation.id)
         db.commit()
     except Exception:
         db.rollback()
@@ -272,7 +284,8 @@ async def add_donation_images(donation_id: UUID, files: list[UploadFile] = File(
         raise
     for _, record in saved:
         db.refresh(record)
-    return [DonationImageResponse.model_validate(record).model_copy(update={"download_url": f"/donations/{donation.id}/images/{record.id}"}) for _, record in saved]
+    records = [record for _, record in saved] + duplicates
+    return [DonationImageResponse.model_validate(record).model_copy(update={"download_url": f"/donations/{donation.id}/images/{record.id}"}) for record in records]
 
 
 @router.get("/{donation_id}/images/{image_id}")

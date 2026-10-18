@@ -718,6 +718,25 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(json.loads(failed[1])["items"][0]["status"], "FAILED")
         self.assertNotIn("key", failed[1].lower())
 
+        # A rejected image leaves the same draft available for a valid retry.
+        retry_draft = json.loads(self.create_donation(donor["access_token"], details_confirmed=False)[1])
+        retry_id = retry_draft["id"]
+        valid_png = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+        invalid = upload_request(f"/donations/{retry_id}/images?finalize=false", "notes.txt", b"not an image", "text/plain", donor["access_token"])
+        self.assertEqual(invalid[0], 415, invalid[1])
+        self.assertEqual(request("GET", f"/donations/{retry_id}", token=donor["access_token"])[0], 200)
+        resumed = upload_request(f"/donations/{retry_id}/images?finalize=false", "package.png", valid_png, "image/png", donor["access_token"])
+        self.assertEqual(resumed[0], 201, resumed[1])
+        self.assertEqual(len(json.loads(resumed[1])), 1)
+        idempotent_retry = upload_request(f"/donations/{retry_id}/images?finalize=true", "package.png", valid_png, "image/png", donor["access_token"])
+        self.assertEqual(idempotent_retry[0], 201, idempotent_retry[1])
+        self.assertEqual(json.loads(idempotent_retry[1])[0]["id"], json.loads(resumed[1])[0]["id"])
+        # A subsequent upload against the submitted donation is rejected to avoid duplicate images.
+        duplicate = upload_request(f"/donations/{retry_id}/images", "package.png", valid_png, "image/png", donor["access_token"])
+        self.assertEqual(duplicate[0], 409, duplicate[1])
+        with self.Session() as session:
+            self.assertEqual(session.scalar(select(func.count(DonationImage.id)).where(DonationImage.donation_id == UUID(retry_id))), 1)
+
     def test_pharmacist_review_has_explicit_ocr_action(self):
         source = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "PharmacistReview.tsx").read_text()
         self.assertIn("'Run OCR'", source)

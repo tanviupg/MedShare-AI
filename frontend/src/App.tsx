@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { ArrowLeft, Heart, LogOut, Plus, ShieldCheck, Upload } from 'lucide-react'
+import { ArrowLeft, Heart, LogOut, Plus, ShieldCheck } from 'lucide-react'
 import { API_BASE_URL } from './config'
 import PharmacistReview from './PharmacistReview'
 import PharmacistInventory from './PharmacistInventory'
@@ -30,6 +30,16 @@ const successText: Record<Role, string> = { DONOR: 'Donor dashboard', PATIENT: '
 const inputClass = 'mt-1.5 w-full rounded-xl border border-[#dce4d9] bg-white px-3.5 py-3 text-sm outline-none transition focus:border-[#719a6c] focus:ring-2 focus:ring-[#719a6c]/15'
 const statusStyle: Record<DonationStatus, string> = { PENDING_REVIEW: 'bg-amber-50 text-amber-800', APPROVED: 'bg-emerald-50 text-emerald-800', REJECTED: 'bg-red-50 text-red-700', CANCELLED: 'bg-slate-100 text-slate-600' }
 const donorStatus: Record<DonationStatus, string> = { PENDING_REVIEW: 'Under clinic verification', APPROVED: 'Approved', REJECTED: 'Rejected', CANCELLED: 'Cancelled' }
+
+function PhotoPreview({ file, alt }: { file: File; alt: string }) {
+  const [url, setUrl] = useState('')
+  useEffect(() => {
+    const previewUrl = URL.createObjectURL(file)
+    setUrl(previewUrl)
+    return () => URL.revokeObjectURL(previewUrl)
+  }, [file])
+  return <img src={url} alt={alt} className="size-20 rounded-lg bg-[#f7f8f5] object-cover" />
+}
 
 function App() {
   const [mode, setMode] = useState<'login' | 'signup'>('signup')
@@ -101,29 +111,53 @@ function App() {
     setAdminTab('Dashboard')
   }
 
-  async function submitDonation(event: FormEvent<HTMLFormElement>) {
+  async function submitDonation(event: FormEvent<HTMLFormElement>, selectedPhotos: File[]) {
     event.preventDefault()
     if (!token) return
     setDonationError('')
     setDonationBusy(true)
     try {
+      const retry = sessionStorage.getItem('medshare_donation_retry')
+      const pending = retry ? JSON.parse(retry) as { donation: Donation; payload: { pickup_address: FormDataEntryValue | null; donor_expiry_date: FormDataEntryValue | null }; uploaded: string[]; failed: string[] } : null
+      const chosenFiles = selectedPhotos.filter((file) => file.size > 0)
+      const files = chosenFiles
+      if (!files.length) throw new Error('Choose at least one failed medicine photo to retry.')
       const form = new FormData(event.currentTarget)
-      const files = (form.getAll('images') as File[]).filter((file) => file.size > 0)
-      if (!files.length) throw new Error('Upload at least one medicine photo to submit your donation.')
       const payload = { pickup_address: form.get('pickup_address'), donor_expiry_date: form.get('donor_expiry_date') || null }
-      const response = await fetch(`${API_BASE_URL}/donations`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-      const donation = await response.json() as Donation & { detail?: string }
-      if (!response.ok) throw new Error(safeApiErrorMessage(donation, 'Could not submit donation.'))
-      const images = new FormData()
-      files.forEach((file) => images.append('files', file))
-      const upload = await fetch(`${API_BASE_URL}/donations/${donation.id}/images`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: images })
-      if (!upload.ok) {
-        const result = await upload.json() as { detail?: string }
-        throw new Error(`Donation created, but its photos could not be submitted: ${result.detail ?? 'please try again.'}`)
+      let donation: Donation
+      if (pending) donation = pending.donation
+      else {
+        const response = await fetch(`${API_BASE_URL}/donations`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+        const result = await response.json() as Donation & { detail?: string }
+        if (!response.ok) throw new Error(safeApiErrorMessage(result, 'Could not submit donation.'))
+        donation = result
+      }
+      const uploaded: string[] = []
+      const failed: string[] = []
+      for (const [index, file] of files.entries()) {
+        const images = new FormData()
+        images.append('files', file)
+        try {
+          const finalPhoto = index === files.length - 1 && failed.length === 0
+          const upload = await fetch(`${API_BASE_URL}/donations/${donation.id}/images?finalize=${finalPhoto}`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: images })
+          if (!upload.ok) {
+            if (pending && upload.status === 409) { uploaded.push(file.name); continue }
+            throw new Error(safeApiErrorMessage(await upload.json(), 'Photo upload failed.'))
+          }
+          uploaded.push(file.name)
+        } catch { failed.push(file.name) }
+      }
+      if (failed.length) {
+        setDonations((current) => [donation, ...current.filter((item) => item.id !== donation.id)])
+        sessionStorage.setItem('medshare_donation_retry', JSON.stringify({ donation, payload: pending?.payload ?? payload, uploaded: [...(pending?.uploaded ?? []), ...uploaded], failed }))
+        setDonationError(`Donation ${donation.id} was created. Uploaded: ${uploaded.join(', ') || 'none'}. Failed: ${failed.join(', ')}. Choose the failed photos again to retry; the donation will not be recreated.`)
+        setView('create')
+        return
       }
       const refresh = await fetch(`${API_BASE_URL}/donations/${donation.id}`, { headers: { Authorization: `Bearer ${token}` } })
       if (refresh.ok) Object.assign(donation, await refresh.json())
-      setDonations((current) => [donation, ...current])
+      sessionStorage.removeItem('medshare_donation_retry')
+      setDonations((current) => [donation, ...current.filter((item) => item.id !== donation.id)])
       setView('submitted')
     } catch (reason) { setDonationError(reason instanceof Error ? reason.message : 'Could not submit donation.') }
     finally { setDonationBusy(false) }
@@ -183,15 +217,100 @@ function App() {
   </main>
 }
 
-function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLogout }: { donations: Donation[]; view: 'list' | 'create' | 'submitted'; setView: (view: 'list' | 'create' | 'submitted') => void; error: string; busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onLogout: () => void }) {
+function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLogout }: { donations: Donation[]; view: 'list' | 'create' | 'submitted'; setView: (view: 'list' | 'create' | 'submitted') => void; error: string; busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>, files: File[]) => void; onLogout: () => void }) {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
+  const [qualityWarnings, setQualityWarnings] = useState<Record<string, string>>({})
+  const [cameraError, setCameraError] = useState('')
+  const [cameraActive, setCameraActive] = useState(false)
+  const [retakeIndex, setRetakeIndex] = useState<number | null>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+
+  useEffect(() => () => streamRef.current?.getTracks().forEach((track) => track.stop()), [])
+
+  function inspectPhoto(file: File) {
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) return 'Use a JPEG, PNG, or WebP photo.'
+    if (file.size > 5 * 1024 * 1024) return 'Each photo must be 5 MB or smaller. Retake or choose a smaller photo.'
+    const image = new Image()
+    image.onload = () => {
+      const canvas = document.createElement('canvas'); canvas.width = 64; canvas.height = 64
+      const context = canvas.getContext('2d'); if (!context) return
+      context.drawImage(image, 0, 0, 64, 64)
+      const pixels = context.getImageData(0, 0, 64, 64).data
+      let luminance = 0; let variation = 0
+      for (let i = 0; i < pixels.length; i += 4) { const y = .2126 * pixels[i] + .7152 * pixels[i + 1] + .0722 * pixels[i + 2]; luminance += y; variation += y * y }
+      luminance /= 4096
+      const deviation = Math.sqrt(Math.max(0, variation / 4096 - luminance * luminance))
+      if (luminance < 35 || deviation < 12) setQualityWarnings((current) => ({ ...current, [file.name]: `${file.name} may be too dark or blurry. Retake it in good light with the printed details in focus.` }))
+      else setQualityWarnings((current) => { const next = { ...current }; delete next[file.name]; return next })
+      URL.revokeObjectURL(image.src)
+    }
+    image.src = URL.createObjectURL(file)
+    return ''
+  }
+
+  function addPhotos(incoming: File[]) {
+    setCameraError('')
+    const accepted: File[] = []
+    for (const file of incoming) {
+      const warning = inspectPhoto(file)
+      if (warning) setCameraError(warning)
+      else accepted.push(file)
+    }
+    setSelectedFiles((current) => {
+      const next = [...current]
+      for (const file of accepted) {
+        if (next.length >= 8) { setCameraError('A donation can include up to 8 photos.'); break }
+        if (retakeIndex !== null && next[retakeIndex]) next[retakeIndex] = file
+        else next.push(file)
+      }
+      return next
+    })
+    setRetakeIndex(null)
+  }
+
+  async function startCamera(index: number | null = null) {
+    setCameraError(''); setRetakeIndex(index)
+    if (!navigator.mediaDevices?.getUserMedia) { setCameraError('Camera access is not supported here. Use Upload from Gallery instead.'); return }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = stream
+      setCameraActive(true)
+      requestAnimationFrame(() => { if (videoRef.current) videoRef.current.srcObject = stream })
+    } catch {
+      setCameraError('Camera permission was not granted or no camera is available. Allow camera access in your browser settings, or upload a photo from your gallery.')
+      setRetakeIndex(null)
+    }
+  }
+
+  function stopCamera() { streamRef.current?.getTracks().forEach((track) => track.stop()); streamRef.current = null; setCameraActive(false) }
+
+  function capturePhoto() {
+    const video = videoRef.current
+    if (!video || !video.videoWidth || !video.videoHeight) { setCameraError('The camera is not ready yet. Please wait and try again.'); return }
+    const canvas = document.createElement('canvas'); canvas.width = video.videoWidth; canvas.height = video.videoHeight
+    const context = canvas.getContext('2d'); if (!context) return
+    context.drawImage(video, 0, 0)
+    canvas.toBlob((blob) => {
+      if (!blob) { setCameraError('Could not capture this photo. Please try again.'); return }
+      const photo = new File([blob], `medicine-photo-${Date.now()}.jpg`, { type: 'image/jpeg' })
+      if (photo.size > 5 * 1024 * 1024) { setCameraError('This camera photo exceeds 5 MB. Move closer and retake it.'); return }
+      addPhotos([photo]); stopCamera()
+    }, 'image/jpeg', 0.92)
+  }
 
   return <div className="mt-8 text-left">
     <div className="mb-6 flex items-center justify-between border-b border-[#edf0ea] pb-5"><div><p className="text-xs font-semibold uppercase tracking-[.12em] text-[#71886d]">Donor dashboard</p><h2 className="mt-1 text-xl font-semibold">{view === 'create' ? 'Donate unused medicine' : view === 'submitted' ? 'Donation submitted' : 'My donations'}</h2></div><button onClick={onLogout} aria-label="Log out" className="rounded-full p-2 text-[#718078] hover:bg-[#f5f7f2]"><LogOut size={18} /></button></div>
     {view === 'submitted' ? <div className="rounded-2xl border border-[#dce9d6] bg-[#f5f9f2] p-5"><h3 className="font-semibold">Thank you for donating</h3><p className="mt-1 text-sm leading-6 text-[#718078]">Your photos and pickup information are submitted. Our clinic pharmacist will identify and verify the medicine. Follow the status in My donations.</p><button onClick={() => setView('list')} className="mt-5 rounded-full bg-[#174e3f] px-5 py-2.5 text-sm font-semibold text-white">View my donations</button></div> : view === 'create' ? <>
       <button onClick={() => setView('list')} className="mb-4 flex items-center gap-1.5 text-sm font-medium text-[#718078]"><ArrowLeft size={16} /> Back to my donations</button>
-      <form onSubmit={onSubmit} className="space-y-4"><p className="text-sm leading-6 text-[#718078]">Upload photos and provide a pickup address. You do not need to identify the medicine; our clinic pharmacist will.</p>
-        <label className="block text-sm font-medium">Medicine photos <span className="font-normal text-[#718078]">(up to 8, JPEG/PNG/WebP, 5 MB each)</span><span className="mt-1.5 flex cursor-pointer items-center gap-2 rounded-xl border border-dashed border-[#cad7c5] bg-[#fbfcfa] px-4 py-3 text-sm text-[#718078]"><Upload size={17} /> {selectedFiles.length ? selectedFiles.map((file) => file.name).join(', ') : 'Choose unused medicine or package photos'}<input className="sr-only" name="images" type="file" accept="image/jpeg,image/png,image/webp" multiple required onChange={(event) => setSelectedFiles(Array.from(event.target.files ?? []).slice(0, 8))} /></span></label>
+      <form onSubmit={(event) => onSubmit(event, selectedFiles)} className="space-y-4"><p className="text-sm leading-6 text-[#718078]">Upload photos and provide a pickup address. You do not need to identify the medicine; our clinic pharmacist will.</p>
+        <p className="rounded-xl bg-[#f5f7f2] p-3 text-sm leading-6 text-[#52675d]">Photograph the full strip or box and its printed medicine details, including batch and expiry where available. Loose pills or cut blister fragments without traceable information may not be accepted. Photos that are too dark, blurry, or unreadable may need to be retaken. Photo checks only flag possible readability issues; they do not identify or authenticate medicine.</p>
+        <div className="space-y-3"><p className="text-sm font-medium">Medicine photos <span className="font-normal text-[#718078]">(up to 8, JPEG/PNG/WebP, 5 MB each)</span></p><div className="flex flex-wrap gap-2"><button type="button" onClick={() => void startCamera()} className="rounded-full bg-[#174e3f] px-4 py-2.5 text-sm font-semibold text-white">Take Photo</button><label className="cursor-pointer rounded-full border border-[#cad7c5] bg-[#fbfcfa] px-4 py-2.5 text-sm font-semibold text-[#52675d]">Upload from Gallery<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { addPhotos(Array.from(event.target.files ?? [])); event.currentTarget.value = '' }} /></label></div>
+          {cameraActive && <div className="rounded-2xl border border-[#dce4d9] bg-[#f7f8f5] p-3"><video ref={videoRef} autoPlay playsInline muted className="max-h-80 w-full rounded-xl object-contain" /><div className="mt-3 flex gap-2"><button type="button" onClick={capturePhoto} className="rounded-full bg-[#174e3f] px-4 py-2 text-sm font-semibold text-white">Capture photo</button><button type="button" onClick={stopCamera} className="rounded-full border border-[#cad7c5] px-4 py-2 text-sm font-semibold">Cancel</button></div><p className="mt-2 text-xs text-[#718078]">Frame the full strip or box, then capture printed details, batch, expiry, and tablet packaging clearly.</p></div>}
+          {cameraError && <p role="alert" className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-900">{cameraError}</p>}
+          {selectedFiles.map((file, index) => <div key={`${file.name}-${index}`} className="flex items-center gap-3 rounded-xl border border-[#e4e9e0] p-3"><PhotoPreview file={file} alt={`Preview of ${file.name}`} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">Photo {index + 1}: {file.name}</p><p className="text-xs text-[#718078]">Check that printed details and packaging are readable.</p>{qualityWarnings[file.name] && <p className="mt-1 text-xs text-amber-800">{qualityWarnings[file.name]}</p>}</div><button type="button" onClick={() => void startCamera(index)} className="text-xs font-semibold text-[#174e3f]">Retake</button><button type="button" onClick={() => setSelectedFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))} className="text-xs font-semibold text-red-700">Remove</button></div>)}
+        </div>
         <label className="block text-sm font-medium">Pickup address<input className={inputClass} name="pickup_address" autoComplete="street-address" required maxLength={500} placeholder="Where can the clinic collect the medicine?" /></label>
         <label className="block text-sm font-medium">Expiry date (if known)<input className={inputClass} type="date" name="donor_expiry_date" min={new Date().toISOString().slice(0, 10)} /></label>
         {error && <p role="alert" className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}

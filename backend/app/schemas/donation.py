@@ -113,6 +113,11 @@ class DonationReviewCreate(BaseModel):
             not self.physical_package_checked or self.verified_details is None
         ):
             raise ValueError("Physically check the package and submit verified medicine details before approval")
+        if self.decision == DonationReviewDecision.APPROVED and self.verified_details is not None:
+            if not self.verified_details.batch_number or not self.verified_details.batch_number.strip():
+                raise ValueError("A traceable batch number is required before approval")
+            if self.verified_details.expiry_date is None:
+                raise ValueError("A verified expiry date is required before approval")
         if (self.decision == DonationReviewDecision.APPROVED and self.verified_details is not None
                 and self.verified_details.expiry_date < business_today()):
             raise ValueError("Expired medicine cannot be approved")
