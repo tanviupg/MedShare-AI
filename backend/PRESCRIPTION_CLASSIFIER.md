@@ -2,8 +2,12 @@
 
 The upload path can use OpenAI CLIP ViT-B/32 as a local, zero-shot image screen for
 printed/handwritten prescription-like documents, dogs, cats, people, unrelated
-documents, and unrelated objects. PaddleOCR remains a separate text extraction
-step. Neither component verifies the prescriber or authenticity, and pharmacist
+documents, and unrelated objects. Donor medicine-photo uploads also use this local
+checkpoint to screen medicine packaging, blister packs, and unrelated subjects.
+Images without clearly visible packaging are rejected with a request for a clearer
+photo; the screen does not identify loose pills or a medicine name and does not approve
+a donation. PaddleOCR remains a separate text extraction step for prescription uploads.
+Neither component verifies the prescriber or authenticity, and pharmacist physical
 verification remains mandatory.
 
 ## Model and runtime
@@ -71,13 +75,19 @@ the Patient Dashboard or its existing prescription upload endpoint:
 2. Test printed and handwritten prescriptions under typical lighting and rotation.
    They should proceed to the normal pending pharmacist review, never be approved
    automatically.
-3. Test blurry, cropped, unfamiliar, and mixed-content images. Ambiguous results
-   should remain pending review rather than being treated as verified.
+3. Test blurry, cropped, unfamiliar, and mixed-content images. Ambiguous prescription
+   images should proceed to pharmacist review, never be treated as verified.
 4. Repeat the check with PaddleOCR unavailable. Classifier results still screen
    clear unrelated images; OCR failure by itself must not reject an image.
+5. For donor uploads, test ordinary medicine packaging and blister packs, along with
+   dog, cat, person, landscape, unrelated object, loose pills without packaging, and
+   ambiguous images. Only confident medicine-packaging classifications should be stored;
+   uncertain donor images should request a clearer photo. Screening never substitutes
+   for pharmacist physical verification.
 
-These are manual real-model checks and require the optional dependencies and downloaded
-weights above. The automated mocked unit test exercises the rejection and pre-storage
-ordering only; it does not demonstrate real CLIP model behavior. Record any false
-rejects and adjust thresholds only after reviewing a representative test set. CLIP
-scores are not calibrated probabilities.
+These checks require the optional inference dependencies and local weights above. The
+automated tests exercise the real local model on a generated package sample and any
+available local image fixtures, as well as mocked fail-closed cases. They are not a
+broad validation study. Record false rejects and missed unrelated photos from a
+representative test set before changing thresholds; CLIP scores are not calibrated
+probabilities.

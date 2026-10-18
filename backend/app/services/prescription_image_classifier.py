@@ -23,6 +23,39 @@ PROMPTS = {
 PRESCRIPTION_LABELS = {"printed_prescription", "handwritten_prescription"}
 UNRELATED_LABELS = {"dog", "cat", "person", "unrelated_document", "unrelated_object"}
 
+MEDICINE_PHOTO_PROMPTS = {
+    "medicine_packaging": (
+        "a photo of a pharmaceutical medicine box",
+        "a photo of medicine packaging",
+        "a photo of a medicine blister pack with tablets sealed in foil cavities",
+        "a close-up photo of medicine in its original package",
+        "a photo of a pharmacy medicine carton or packet",
+        "a photo of labeled medicine bottle packaging",
+        "a package of pharmaceutical tablets",
+        "a photo of packaged medication ready for a patient",
+    ),
+    "unrelated": (
+        "a photo of a dog",
+        "a close-up photo of a pet dog",
+        "a photo of a dog outdoors",
+        "a photo of a cat",
+        "a photo of a pet cat",
+        "a photo of a person or people",
+        "a photo of a landscape, scenery, or nature",
+        "a photo of an unrelated everyday object or document",
+    ),
+    "ambiguous": (
+        "a blurry unclear photo where the subject cannot be identified",
+        "a photograph of an object too small or indistinct to classify",
+        "a close-up photo with no recognizable context",
+        "an image where the main subject is unclear",
+        "an out of focus photo",
+        "a dark photo that is difficult to identify",
+        "a low quality unclear photograph",
+        "a cropped photo with no recognizable subject",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class ImageClassification:
@@ -58,6 +91,28 @@ class LocalClipPrescriptionClassifier:
         best_index, confidence = ranked[0]
         margin = confidence - ranked[1][1] if len(ranked) > 1 else confidence
         return ImageClassification(list(PROMPTS)[best_index], float(confidence), float(margin))
+
+    def classify_medicine_photo(self, image_bytes: bytes) -> ImageClassification:
+        """Classify medicine packaging or clearly unrelated content without identifying medicine."""
+        import torch
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(image_bytes)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+        texts = [prompt for prompts in MEDICINE_PHOTO_PROMPTS.values() for prompt in prompts]
+        inputs = self.processor(text=texts, images=image, return_tensors="pt", padding=True)
+        with torch.inference_mode():
+            prompt_scores = self.model(**inputs).logits_per_image[0]
+        class_scores = []
+        offset = 0
+        for prompts in MEDICINE_PHOTO_PROMPTS.values():
+            class_scores.append(prompt_scores[offset:offset + len(prompts)].max())
+            offset += len(prompts)
+        probabilities = torch.stack(class_scores).softmax(dim=0).tolist()
+        ranked = sorted(enumerate(probabilities), key=lambda item: item[1], reverse=True)
+        best_index, confidence = ranked[0]
+        margin = confidence - ranked[1][1]
+        return ImageClassification(list(MEDICINE_PHOTO_PROMPTS)[best_index], float(confidence), float(margin))
 
 
 @lru_cache(maxsize=2)

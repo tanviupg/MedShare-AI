@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { CalendarDays, ImageOff, MapPin, PackageCheck, Search, ShieldCheck, Upload, X } from 'lucide-react'
 import { API_BASE_URL } from './config'
 import { safeApiErrorMessage } from './apiErrors.mjs'
@@ -93,6 +93,8 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
   const [requestsLoading, setRequestsLoading] = useState(false)
   const [requestQuantity, setRequestQuantity] = useState<Record<string, number>>({})
   const [requestBusy, setRequestBusy] = useState<string | null>(null)
+  const [cancelBusy, setCancelBusy] = useState<string | null>(null)
+  const cancelBusyRef = useRef(false)
   const [requestMessage, setRequestMessage] = useState('')
   const [pickupAddresses, setPickupAddresses] = useState<Record<string, string>>({})
   const [prescriptionFiles, setPrescriptionFiles] = useState<Record<string, File | undefined>>({})
@@ -189,7 +191,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
     setSelectedMedicine(null)
   }
 
-  async function loadRequests() {
+  async function loadRequests(): Promise<boolean> {
     setTab('requests')
     setRequestMessage('')
     setRequestsLoading(true)
@@ -200,10 +202,35 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
       const data = await response.json() as MedicineRequest[] & { detail?: string }
       if (!response.ok) throw new Error(safeApiErrorMessage(data, 'Could not load your requests.'))
       setRequests(data)
+      return true
     } catch (cause) {
       setRequestMessage(cause instanceof Error ? cause.message : 'Could not load your requests.')
+      return false
     } finally {
       setRequestsLoading(false)
+    }
+  }
+
+  async function cancelRequest(item: MedicineRequest) {
+    if (item.status !== 'PENDING' || cancelBusyRef.current) return
+    if (!window.confirm('Cancel this pending medicine request?')) return
+    cancelBusyRef.current = true
+    setCancelBusy(item.id)
+    setRequestMessage('Cancelling your request…')
+    try {
+      const response = await fetch(`${API_BASE_URL}/patient/requests/${item.id}/cancel`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const body = await response.json() as MedicineRequest & { detail?: string }
+      if (!response.ok) throw new Error(safeApiErrorMessage(body, 'Could not cancel your request.'))
+      const refreshed = await loadRequests()
+      setRequestMessage(refreshed ? 'Request cancelled successfully.' : 'Request cancelled, but your request list could not refresh. Please reload My Requests.')
+    } catch (cause) {
+      setRequestMessage(cause instanceof Error ? cause.message : 'Could not cancel your request.')
+    } finally {
+      cancelBusyRef.current = false
+      setCancelBusy(null)
     }
   }
 
@@ -420,6 +447,9 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
                   <p className="font-semibold">Fulfilled</p>
                   <p className="mt-1">{item.requested_quantity} {item.unit} dispensed{item.fulfilled_at ? ` · ${new Date(item.fulfilled_at).toLocaleString()}` : ''}</p>
                 </div>}
+                {item.status === 'PENDING' && <button type="button" disabled={cancelBusy !== null} onClick={() => void cancelRequest(item)} className="mt-3 rounded-full border border-red-200 px-3 py-2 text-xs font-semibold text-red-700 disabled:opacity-50">
+                  {cancelBusy === item.id ? 'Cancelling…' : 'Cancel Request'}
+                </button>}
               </div>
               <span className="h-fit rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold">{item.status === 'APPROVED' ? 'READY FOR PICKUP' : item.status.replaceAll('_', ' ')}</span>
             </div>

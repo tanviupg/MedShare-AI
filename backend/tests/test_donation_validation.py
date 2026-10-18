@@ -1,9 +1,40 @@
 import unittest
 from datetime import date, timedelta
+from io import BytesIO
+from PIL import Image
 
 from pydantic import ValidationError
 
 from app.schemas.donation import DonationReviewCreate
+from app.api.routes.donations import validate_image_content
+
+
+class DonationImageValidationTests(unittest.TestCase):
+    def encoded_image(self, format, **options):
+        image = Image.new("RGB", (12, 12), (30, 100, 180))
+        output = BytesIO()
+        image.save(output, format=format, **options)
+        return output.getvalue()
+
+    def test_decodable_supported_images_are_accepted(self):
+        for format, kind in (("JPEG", "jpeg"), ("PNG", "png"), ("WEBP", "webp")):
+            with self.subTest(format=format):
+                self.assertEqual(validate_image_content(self.encoded_image(format)), kind)
+
+    def test_progressive_jpeg_is_accepted(self):
+        self.assertEqual(validate_image_content(self.encoded_image("JPEG", progressive=True)), "jpeg")
+
+    def test_corrupt_or_renamed_non_image_content_is_rejected(self):
+        self.assertIsNone(validate_image_content(b"not an image named medicine.jpg"))
+        self.assertIsNone(validate_image_content(b"\xff\xd8\xff" + b"corrupt jpeg data"))
+        valid_jpeg = self.encoded_image("JPEG")
+        self.assertIsNone(validate_image_content(valid_jpeg[:-20]))
+        self.assertIsNone(validate_image_content(b""))
+
+    def test_image_format_must_match_its_signature(self):
+        jpeg = self.encoded_image("JPEG")
+        forged_signature = b"\x89PNG\r\n\x1a\n" + jpeg[8:]
+        self.assertIsNone(validate_image_content(forged_signature))
 
 
 class DonationApprovalValidationTests(unittest.TestCase):

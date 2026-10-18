@@ -13,6 +13,7 @@ from app.db.database import get_db
 from app.models import Donation, DonationImage, DonationReview, DonationStatus, Inventory, InventoryStatus, User, UserRole, MedicineExtraction, ExtractionStatus
 from app.schemas.donation import DonationCreate, DonationImageResponse, DonationResponse, DonationReviewCreate, DonationReviewResponse, DonorDonationResponse
 from app.services.donation_storage import LocalDonationStorage
+from app.services.donation_image_screening import screen_medicine_photo
 from app.services.medicine_extraction import ExtractionConfigurationError, get_extraction_provider
 from app.models import ClinicProfile, ClinicVerificationStatus
 from datetime import date, datetime, timezone
@@ -35,6 +36,28 @@ def detect_image_type(content: bytes) -> str | None:
     if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
         return "webp"
     return None
+
+
+def validate_image_content(content: bytes) -> str | None:
+    """Return a supported image kind only after Pillow verifies and loads it."""
+    kind = detect_image_type(content)
+    if kind is None or not content:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        with Image.open(BytesIO(content)) as image:
+            if image.format != {"jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}[kind]:
+                return None
+            image.verify()
+        with Image.open(BytesIO(content)) as image:
+            if image.format != {"jpeg": "JPEG", "png": "PNG", "webp": "WEBP"}[kind]:
+                return None
+            image.load()
+    except Exception:
+        return None
+    return kind
 
 
 def owned_donation(donation_id: UUID, user: User, db: Session) -> Donation:
@@ -247,10 +270,13 @@ async def add_donation_images(donation_id: UUID, files: list[UploadFile] = File(
             content = await upload.read(MAX_IMAGE_BYTES + 1)
             if len(content) > MAX_IMAGE_BYTES:
                 raise HTTPException(status_code=413, detail="Each image must be 5 MB or smaller")
-            kind = detect_image_type(content)
+            kind = validate_image_content(content)
             content_type = upload.content_type or ""
-            if kind not in IMAGE_EXTENSIONS or content_type not in ALLOWED_IMAGE_TYPES or content_type != IMAGE_CONTENT_TYPES.get(kind):
+            if kind is None:
+                raise HTTPException(status_code=415, detail="The file is empty or is not a complete, decodable JPEG, PNG, or WebP image")
+            if content_type not in ALLOWED_IMAGE_TYPES or content_type != IMAGE_CONTENT_TYPES.get(kind):
                 raise HTTPException(status_code=415, detail="Only JPEG, PNG, and WebP images are accepted")
+            screen_medicine_photo(content)
             digest = hashlib.sha256(content).digest()
             duplicate = next((image for image in donation.images if hashlib.sha256(storage.read(image.storage_key)).digest() == digest), None)
             if duplicate is not None:

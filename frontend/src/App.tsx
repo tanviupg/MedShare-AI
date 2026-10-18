@@ -14,6 +14,7 @@ import PharmacistDashboard from './PharmacistDashboard'
 import AdminClinicVerification from './AdminClinicVerification'
 import AdminDashboard from './AdminDashboard'
 import { safeApiErrorMessage } from './apiErrors.mjs'
+import { DonationUploadError, uploadDonationPhoto } from './donationUpload.mjs'
 
 type Role = 'DONOR' | 'PATIENT' | 'CLINIC_PHARMACIST' | 'ADMIN'
 type SignupRole = Exclude<Role, 'ADMIN'>
@@ -55,6 +56,7 @@ function App() {
   const [operationsRevision, setOperationsRevision] = useState(0)
   const [clinicTab, setClinicTab] = useState<ClinicTab>('Overview')
   const [adminTab, setAdminTab] = useState<AdminTab>('Dashboard')
+  const [donorFormRevision, setDonorFormRevision] = useState(0)
 
   useEffect(() => {
     if (!token) return
@@ -113,7 +115,7 @@ function App() {
 
   async function submitDonation(event: FormEvent<HTMLFormElement>, selectedPhotos: File[]) {
     event.preventDefault()
-    if (!token) return
+    if (!token) return false
     setDonationError('')
     setDonationBusy(true)
     try {
@@ -134,33 +136,41 @@ function App() {
       }
       const uploaded: string[] = []
       const failed: string[] = []
+      const failureMessages: string[] = []
       for (const [index, file] of files.entries()) {
-        const images = new FormData()
-        images.append('files', file)
         try {
           const finalPhoto = index === files.length - 1 && failed.length === 0
-          const upload = await fetch(`${API_BASE_URL}/donations/${donation.id}/images?finalize=${finalPhoto}`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: images })
-          if (!upload.ok) {
-            if (pending && upload.status === 409) { uploaded.push(file.name); continue }
-            throw new Error(safeApiErrorMessage(await upload.json(), 'Photo upload failed.'))
-          }
+          await uploadDonationPhoto({ apiBaseUrl: API_BASE_URL, donationId: donation.id, token, file, finalize: finalPhoto })
           uploaded.push(file.name)
-        } catch { failed.push(file.name) }
+        } catch (reason) {
+          if (pending && reason instanceof DonationUploadError && reason.status === 409) { uploaded.push(file.name); continue }
+          failed.push(file.name)
+          failureMessages.push(reason instanceof Error ? reason.message : `${file.name}: Photo upload failed. Try again.`)
+        }
       }
       if (failed.length) {
         setDonations((current) => [donation, ...current.filter((item) => item.id !== donation.id)])
         sessionStorage.setItem('medshare_donation_retry', JSON.stringify({ donation, payload: pending?.payload ?? payload, uploaded: [...(pending?.uploaded ?? []), ...uploaded], failed }))
-        setDonationError(`Donation ${donation.id} was created. Uploaded: ${uploaded.join(', ') || 'none'}. Failed: ${failed.join(', ')}. Choose the failed photos again to retry; the donation will not be recreated.`)
+        setDonationError(
+  failureMessages.some((message) =>
+    message.toLowerCase().includes('does not appear to show medicine')
+  )
+    ? 'Not a medicine photo. Upload the medicine or its packaging.'
+    : failureMessages.join(' ')
+)
         setView('create')
-        return
+        return false
       }
       const refresh = await fetch(`${API_BASE_URL}/donations/${donation.id}`, { headers: { Authorization: `Bearer ${token}` } })
       if (refresh.ok) Object.assign(donation, await refresh.json())
       sessionStorage.removeItem('medshare_donation_retry')
       setDonations((current) => [donation, ...current.filter((item) => item.id !== donation.id)])
       setView('submitted')
+      setDonorFormRevision((revision) => revision + 1)
+      return true
     } catch (reason) { setDonationError(reason instanceof Error ? reason.message : 'Could not submit donation.') }
     finally { setDonationBusy(false) }
+    return false
   }
 
   return <main className="min-h-screen bg-[#f7f8f5] px-5 py-10 text-[#18372e] sm:py-16">
@@ -197,7 +207,7 @@ function App() {
             <div id="clinic-panel-4" role="tabpanel" aria-labelledby="clinic-tab-4" hidden={clinicTab !== 'Prescriptions'}><PharmacistPrescriptions token={token} /></div>
             <div id="clinic-panel-5" role="tabpanel" aria-labelledby="clinic-tab-5" hidden={clinicTab !== 'Waste Management'}><PharmacistExpiryWaste token={token} /></div>
             <div id="clinic-panel-6" role="tabpanel" aria-labelledby="clinic-tab-6" hidden={clinicTab !== 'Notifications'}><Notifications token={token} standalone /></div>
-          </> : user.role === 'ADMIN' && token ? <><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ea] pb-3"><p className="text-sm text-[#718078]">Signed in as <b className="text-[#18372e]">{user.name}</b> · {roleLabels[user.role]}</p><button onClick={logout} className="rounded-full px-3 py-2 text-sm font-medium text-[#718078] hover:bg-[#f5f7f2]">Log out</button></div><div className="mt-4 flex justify-end"><Notifications token={token} /></div><><nav aria-label="Admin sections" className="mt-4 flex flex-wrap gap-2 border-b border-[#edf0ea] pb-3"><button type="button" aria-current={adminTab === "Dashboard" ? "page" : undefined} onClick={() => setAdminTab("Dashboard")} className={adminTab === "Dashboard" ? "rounded-full bg-[#e7efe2] px-4 py-2 text-sm font-semibold text-[#174e3f]" : "rounded-full px-4 py-2 text-sm font-semibold text-[#718078]"}>Dashboard</button><button type="button" aria-current={adminTab === "Clinic Verification" ? "page" : undefined} onClick={() => setAdminTab("Clinic Verification")} className={adminTab === "Clinic Verification" ? "rounded-full bg-[#e7efe2] px-4 py-2 text-sm font-semibold text-[#174e3f]" : "rounded-full px-4 py-2 text-sm font-semibold text-[#718078]"}>Clinic Verification</button></nav>{adminTab === "Dashboard" ? <AdminDashboard token={token} /> : <AdminClinicVerification token={token} />}</></> : user.role === 'DONOR' ? <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}<DonorDashboard donations={donations} view={view} setView={setView} error={donationError} busy={donationBusy} onSubmit={submitDonation} onLogout={logout} /></> : <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}{token ? <PatientDiscovery token={token} onLogout={logout} /> : null}</>}
+          </> : user.role === 'ADMIN' && token ? <><div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ea] pb-3"><p className="text-sm text-[#718078]">Signed in as <b className="text-[#18372e]">{user.name}</b> · {roleLabels[user.role]}</p><button onClick={logout} className="rounded-full px-3 py-2 text-sm font-medium text-[#718078] hover:bg-[#f5f7f2]">Log out</button></div><div className="mt-4 flex justify-end"><Notifications token={token} /></div><><nav aria-label="Admin sections" className="mt-4 flex flex-wrap gap-2 border-b border-[#edf0ea] pb-3"><button type="button" aria-current={adminTab === "Dashboard" ? "page" : undefined} onClick={() => setAdminTab("Dashboard")} className={adminTab === "Dashboard" ? "rounded-full bg-[#e7efe2] px-4 py-2 text-sm font-semibold text-[#174e3f]" : "rounded-full px-4 py-2 text-sm font-semibold text-[#718078]"}>Dashboard</button><button type="button" aria-current={adminTab === "Clinic Verification" ? "page" : undefined} onClick={() => setAdminTab("Clinic Verification")} className={adminTab === "Clinic Verification" ? "rounded-full bg-[#e7efe2] px-4 py-2 text-sm font-semibold text-[#174e3f]" : "rounded-full px-4 py-2 text-sm font-semibold text-[#718078]"}>Clinic Verification</button></nav>{adminTab === "Dashboard" ? <AdminDashboard token={token} /> : <AdminClinicVerification token={token} />}</></> : user.role === 'DONOR' ? <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}<DonorDashboard key={donorFormRevision} donations={donations} view={view} setView={setView} error={donationError} busy={donationBusy} onSubmit={submitDonation} onLogout={logout} /></> : <><div className="text-center"><span className="mx-auto grid size-14 place-items-center rounded-2xl bg-[#e7efe2] text-[#63855b]"><Heart size={24} /></span><h1 className="mt-5 text-2xl font-semibold tracking-tight">{successText[user.role]}</h1><p className="mt-2 text-sm text-[#718078]">Signed in as {user.name} Â· {roleLabels[user.role]}</p></div>{token && <div className="mt-4 flex justify-end"><Notifications token={token} /></div>}{token ? <PatientDiscovery token={token} onLogout={logout} /> : null}</>}
         </div> : <>
           <h1 className="text-2xl font-semibold tracking-tight">{mode === 'signup' ? 'Join MedShare AI' : 'Welcome back'}</h1>
           <p className="mt-2 text-sm leading-6 text-[#718078]">{mode === 'signup' ? 'Create a secure account to get started.' : 'Sign in to your MedShare AI account.'}</p>
@@ -217,7 +227,7 @@ function App() {
   </main>
 }
 
-function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLogout }: { donations: Donation[]; view: 'list' | 'create' | 'submitted'; setView: (view: 'list' | 'create' | 'submitted') => void; error: string; busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>, files: File[]) => void; onLogout: () => void }) {
+function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLogout }: { donations: Donation[]; view: 'list' | 'create' | 'submitted'; setView: (view: 'list' | 'create' | 'submitted') => void; error: string; busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>, files: File[]) => Promise<boolean>; onLogout: () => void }) {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [qualityWarnings, setQualityWarnings] = useState<Record<string, string>>({})
   const [cameraError, setCameraError] = useState('')
@@ -225,12 +235,36 @@ function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLog
   const [retakeIndex, setRetakeIndex] = useState<number | null>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const galleryInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => () => streamRef.current?.getTracks().forEach((track) => track.stop()), [])
 
-  function inspectPhoto(file: File) {
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) return 'Use a JPEG, PNG, or WebP photo.'
-    if (file.size > 5 * 1024 * 1024) return 'Each photo must be 5 MB or smaller. Retake or choose a smaller photo.'
+  async function submitForm(event: FormEvent<HTMLFormElement>) {
+    const form = event.currentTarget
+    if (!await onSubmit(event, selectedFiles)) return
+    setSelectedFiles([])
+    setQualityWarnings({})
+    setCameraError('')
+    setRetakeIndex(null)
+    stopCamera()
+    form.reset()
+    if (galleryInputRef.current) galleryInputRef.current.value = ''
+  }
+
+  async function inspectPhoto(file: File) {
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) return `${file.name}: use a JPEG, PNG, or WebP photo.`
+    if (file.size === 0) return `${file.name}: the file is empty.`
+    if (file.size > 5 * 1024 * 1024) return `${file.name}: each photo must be 5 MB or smaller. Retake or choose a smaller photo.`
+    const header = new Uint8Array(await file.slice(0, 12).arrayBuffer())
+    const jpeg = header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff
+    const png = header.length >= 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => header[index] === byte)
+    const webp = header.length >= 12 && String.fromCharCode(...header.slice(0, 4)) === 'RIFF' && String.fromCharCode(...header.slice(8, 12)) === 'WEBP'
+    if (!(file.type === 'image/jpeg' && jpeg || file.type === 'image/png' && png || file.type === 'image/webp' && webp)) return `${file.name}: contents do not match a supported JPEG, PNG, or WebP image.`
+    try {
+      const decoded = await createImageBitmap(file)
+      if (!decoded.width || !decoded.height) { decoded.close(); return `${file.name}: the image is empty or corrupted.` }
+      decoded.close()
+    } catch { return `${file.name}: the image is corrupted or cannot be decoded.` }
     const image = new Image()
     image.onload = () => {
       const canvas = document.createElement('canvas'); canvas.width = 64; canvas.height = 64
@@ -249,14 +283,16 @@ function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLog
     return ''
   }
 
-  function addPhotos(incoming: File[]) {
+  async function addPhotos(incoming: File[]) {
     setCameraError('')
     const accepted: File[] = []
+    const rejected: string[] = []
     for (const file of incoming) {
-      const warning = inspectPhoto(file)
-      if (warning) setCameraError(warning)
+      const warning = await inspectPhoto(file)
+      if (warning) rejected.push(warning)
       else accepted.push(file)
     }
+    if (rejected.length) setCameraError(rejected.join(' '))
     setSelectedFiles((current) => {
       const next = [...current]
       for (const file of accepted) {
@@ -296,7 +332,7 @@ function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLog
       if (!blob) { setCameraError('Could not capture this photo. Please try again.'); return }
       const photo = new File([blob], `medicine-photo-${Date.now()}.jpg`, { type: 'image/jpeg' })
       if (photo.size > 5 * 1024 * 1024) { setCameraError('This camera photo exceeds 5 MB. Move closer and retake it.'); return }
-      addPhotos([photo]); stopCamera()
+      void addPhotos([photo]); stopCamera()
     }, 'image/jpeg', 0.92)
   }
 
@@ -304,9 +340,9 @@ function DonorDashboard({ donations, view, setView, error, busy, onSubmit, onLog
     <div className="mb-6 flex items-center justify-between border-b border-[#edf0ea] pb-5"><div><p className="text-xs font-semibold uppercase tracking-[.12em] text-[#71886d]">Donor dashboard</p><h2 className="mt-1 text-xl font-semibold">{view === 'create' ? 'Donate unused medicine' : view === 'submitted' ? 'Donation submitted' : 'My donations'}</h2></div><button onClick={onLogout} aria-label="Log out" className="rounded-full p-2 text-[#718078] hover:bg-[#f5f7f2]"><LogOut size={18} /></button></div>
     {view === 'submitted' ? <div className="rounded-2xl border border-[#dce9d6] bg-[#f5f9f2] p-5"><h3 className="font-semibold">Thank you for donating</h3><p className="mt-1 text-sm leading-6 text-[#718078]">Your photos and pickup information are submitted. Our clinic pharmacist will identify and verify the medicine. Follow the status in My donations.</p><button onClick={() => setView('list')} className="mt-5 rounded-full bg-[#174e3f] px-5 py-2.5 text-sm font-semibold text-white">View my donations</button></div> : view === 'create' ? <>
       <button onClick={() => setView('list')} className="mb-4 flex items-center gap-1.5 text-sm font-medium text-[#718078]"><ArrowLeft size={16} /> Back to my donations</button>
-      <form onSubmit={(event) => onSubmit(event, selectedFiles)} className="space-y-4"><p className="text-sm leading-6 text-[#718078]">Upload photos and provide a pickup address. You do not need to identify the medicine; our clinic pharmacist will.</p>
+      <form onSubmit={(event) => void submitForm(event)} className="space-y-4"><p className="text-sm leading-6 text-[#718078]">Upload photos and provide a pickup address. You do not need to identify the medicine; our clinic pharmacist will.</p>
         <p className="rounded-xl bg-[#f5f7f2] p-3 text-sm leading-6 text-[#52675d]">Photograph the full strip or box and its printed medicine details, including batch and expiry where available. Loose pills or cut blister fragments without traceable information may not be accepted. Photos that are too dark, blurry, or unreadable may need to be retaken. Photo checks only flag possible readability issues; they do not identify or authenticate medicine.</p>
-        <div className="space-y-3"><p className="text-sm font-medium">Medicine photos <span className="font-normal text-[#718078]">(up to 8, JPEG/PNG/WebP, 5 MB each)</span></p><div className="flex flex-wrap gap-2"><button type="button" onClick={() => void startCamera()} className="rounded-full bg-[#174e3f] px-4 py-2.5 text-sm font-semibold text-white">Take Photo</button><label className="cursor-pointer rounded-full border border-[#cad7c5] bg-[#fbfcfa] px-4 py-2.5 text-sm font-semibold text-[#52675d]">Upload from Gallery<input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { addPhotos(Array.from(event.target.files ?? [])); event.currentTarget.value = '' }} /></label></div>
+        <div className="space-y-3"><p className="text-sm font-medium">Medicine photos <span className="font-normal text-[#718078]">(up to 8, JPEG/PNG/WebP, 5 MB each)</span></p><div className="flex flex-wrap gap-2"><button type="button" onClick={() => void startCamera()} className="rounded-full bg-[#174e3f] px-4 py-2.5 text-sm font-semibold text-white">Take Photo</button><label className="cursor-pointer rounded-full border border-[#cad7c5] bg-[#fbfcfa] px-4 py-2.5 text-sm font-semibold text-[#52675d]">Upload from Gallery<input ref={galleryInputRef} className="sr-only" type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { void addPhotos(Array.from(event.target.files ?? [])); event.currentTarget.value = '' }} /></label></div>
           {cameraActive && <div className="rounded-2xl border border-[#dce4d9] bg-[#f7f8f5] p-3"><video ref={videoRef} autoPlay playsInline muted className="max-h-80 w-full rounded-xl object-contain" /><div className="mt-3 flex gap-2"><button type="button" onClick={capturePhoto} className="rounded-full bg-[#174e3f] px-4 py-2 text-sm font-semibold text-white">Capture photo</button><button type="button" onClick={stopCamera} className="rounded-full border border-[#cad7c5] px-4 py-2 text-sm font-semibold">Cancel</button></div><p className="mt-2 text-xs text-[#718078]">Frame the full strip or box, then capture printed details, batch, expiry, and tablet packaging clearly.</p></div>}
           {cameraError && <p role="alert" className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-900">{cameraError}</p>}
           {selectedFiles.map((file, index) => <div key={`${file.name}-${index}`} className="flex items-center gap-3 rounded-xl border border-[#e4e9e0] p-3"><PhotoPreview file={file} alt={`Preview of ${file.name}`} /><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">Photo {index + 1}: {file.name}</p><p className="text-xs text-[#718078]">Check that printed details and packaging are readable.</p>{qualityWarnings[file.name] && <p className="mt-1 text-xs text-amber-800">{qualityWarnings[file.name]}</p>}</div><button type="button" onClick={() => void startCamera(index)} className="text-xs font-semibold text-[#174e3f]">Retake</button><button type="button" onClick={() => setSelectedFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))} className="text-xs font-semibold text-red-700">Remove</button></div>)}
