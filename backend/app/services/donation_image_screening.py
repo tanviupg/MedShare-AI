@@ -19,6 +19,14 @@ AMBIGUOUS_IMAGE_MESSAGE = (
 def screen_medicine_photo(content: bytes, classifier=None) -> None:
     """Require a confident local content classification before storing a donor photo."""
     settings = get_settings()
+
+    if not settings.prescription_image_classifier_enabled:
+        logger.warning(
+            "Medicine photo screening is disabled; "
+            "accepting upload without image classification."
+       )
+        return
+
     if classifier is None:
         try:
             from app.services.prescription_image_classifier import get_prescription_image_classifier
