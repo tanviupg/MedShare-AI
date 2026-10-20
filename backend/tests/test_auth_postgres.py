@@ -731,7 +731,15 @@ class TestAuthPostgres(unittest.TestCase):
         failed = request("GET", f"/donations/{failed_id}/extraction", token=pharmacist["access_token"])
         self.assertEqual(failed[0], 200, failed[1])
         self.assertEqual(json.loads(failed[1])["items"], [])
-        failed_run = request("POST", f"/donations/{failed_id}/extract", token=pharmacist["access_token"])
+        with patch(
+            "app.api.routes.donations.get_extraction_provider",
+            return_value=FailingGeminiProvider(),
+        ):
+            failed_run = request(
+                "POST",
+                f"/donations/{failed_id}/extract",
+                token=pharmacist["access_token"],
+            )
         self.assertEqual(failed_run[0], 200, failed_run[1])
         failed = request("GET", f"/donations/{failed_id}/extraction", token=pharmacist["access_token"])
         self.assertEqual(failed[0], 200, failed[1])
