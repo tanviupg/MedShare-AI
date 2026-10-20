@@ -41,6 +41,16 @@ class ExtractionConfigurationError(RuntimeError):
     pass
 
 
+class ExtractionProviderError(RuntimeError):
+    """A provider could not complete the request; the image may be readable."""
+    pass
+
+
+class UnreadableImageError(RuntimeError):
+    """The provider returned no usable structured information for the image."""
+    pass
+
+
 @dataclass
 class ExtractionResult:
     fields: dict
@@ -113,9 +123,9 @@ class GeminiExtractionProvider:
 
     def extract(self, image: bytes, content_type: str) -> ExtractionResult:
         if not self._api_key:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
+            raise ExtractionConfigurationError("Gemini extraction is not configured. Please contact support or continue with manual verification.")
         if not image or content_type not in {"image/jpeg", "image/png", "image/webp"}:
-            raise RuntimeError("Unsupported or empty image")
+            raise UnreadableImageError("The stored image is empty or has an unsupported format.")
 
         try:
             from google import genai
@@ -137,12 +147,18 @@ class GeminiExtractionProvider:
                     response_schema=GEMINI_RESPONSE_SCHEMA,
                 ),
             )
+        except Exception as exc:
+            raise ExtractionProviderError("AI extraction is temporarily unavailable. Please try again later or continue with manual verification.") from exc
+
+        try:
             response_text = response.text
             if not isinstance(response_text, str) or not response_text.strip():
-                raise ValueError("Empty structured response")
+                raise ExtractionProviderError("AI extraction returned an empty response. Please retry later or continue with manual verification.")
             fields = _parse_gemini_fields(response_text)
+        except ExtractionProviderError:
+            raise
         except Exception as exc:
-            raise RuntimeError("Gemini could not extract this image") from exc
+            raise ExtractionProviderError("AI extraction returned a response that could not be processed. Please retry later or continue with manual verification.") from exc
 
         fields["raw_ocr_text"] = None
         # Gemini does not expose calibrated OCR-character confidence scores.

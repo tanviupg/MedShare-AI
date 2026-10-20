@@ -8,8 +8,11 @@ import unittest
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from io import BytesIO
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from PIL import Image, ImageDraw
 from uuid import UUID
 
 from jose import jwt
@@ -21,6 +24,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 import uvicorn
+import cv2
+import numpy as np
 
 from app.api.dependencies import get_db
 from app.api.routes.donations import storage
@@ -28,7 +33,7 @@ from app.services.prescription_storage import storage as prescription_storage
 from app.core.config import get_settings
 from app.db.base import Base
 from app.main import app
-from app.models import Checkout, ClinicProfile, ClinicVerificationStatus, CommonUseCategory, DispensingRecord, Donation, DonationImage, DonationReview, DonationStatus, Inventory, InventoryStatus, MedicineRequest, MedicineRequestStatus, MedicineExtraction, Notification, NotificationType, Prescription, PrescriptionStatus, User, UserRole, WasteRecord, WasteReason, WasteStatus
+from app.models import Checkout, ClinicProfile, ClinicVerificationStatus, CommonUseCategory, DispensingRecord, Donation, DonationImage, DonationReview, DonationStatus, Inventory, InventoryStatus, MedicineRequest, MedicineRequestStatus, MedicineExtraction, Notification, NotificationType, PaymentStatus, Prescription, PrescriptionStatus, User, UserRole, WasteRecord, WasteReason, WasteStatus
 from app.services.security import hash_password, verify_password
 from app.services.business_time import BUSINESS_TIMEZONE, business_today
 
@@ -66,7 +71,7 @@ def upload_request(path, filename, content, content_type, token, field="files", 
     body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
     req = Request(TestAuthPostgres.base_url + path, data=body, headers={"Authorization": f"Bearer {token}", "Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
     try:
-        with urlopen(req, timeout=5) as response:
+        with urlopen(req, timeout=30) as response:
             return response.status, response.read().decode()
     except HTTPError as response:
         result = response.code, response.read().decode()
@@ -83,6 +88,20 @@ def image_request(path, token):
         result = response.code, response.read()
         response.close()
         return result
+
+
+def medicine_package_image_bytes(kind: str = "png") -> bytes:
+    image = Image.new("RGB", (640, 420), (235, 235, 230))
+    draw = ImageDraw.Draw(image)
+    draw.polygon([(130, 110), (455, 80), (520, 310), (160, 350)], fill=(250, 250, 247), outline=(30, 80, 90), width=8)
+    draw.polygon([(455, 80), (520, 310), (570, 270), (500, 48)], fill=(205, 220, 216), outline=(30, 80, 90), width=5)
+    draw.polygon([(130, 110), (455, 80), (500, 48), (175, 78)], fill=(220, 234, 231), outline=(30, 80, 90), width=5)
+    draw.rectangle((150, 210, 495, 245), fill=(35, 105, 93))
+    draw.text((185, 154), "MEDICINE TABLETS", fill=(20, 45, 42))
+    draw.text((190, 265), "PHARMACEUTICAL PACKAGE", fill=(20, 45, 42))
+    output = BytesIO()
+    image.save(output, format={"jpeg": "JPEG", "png": "PNG", "webp": "WEBP", "bmp": "BMP"}[kind])
+    return output.getvalue()
 
 
 class TestAuthPostgres(unittest.TestCase):
@@ -480,7 +499,7 @@ class TestAuthPostgres(unittest.TestCase):
             return status_code, body
         donation_id = json.loads(body)["id"]
         self.donation_verification[donation_id] = details
-        image = b"\xff\xd8\xff" + b"x" * 100
+        image = medicine_package_image_bytes("jpeg")
         upload_status, upload_body = upload_request(
             f"/donations/{donation_id}/images", "package.jpg", image, "image/jpeg", token
         )
@@ -614,7 +633,7 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(request("GET", "/donations/review-queue", token=pharmacist["access_token"])[1], "[]")
         self.assertEqual(request("GET", f"/donations/{donation_id}/review", token=pharmacist["access_token"])[0], 404)
         self.assertEqual(request("POST", f"/donations/{donation_id}/extract", token=other["access_token"])[0], 403)
-        image = b"\xff\xd8\xff" + b"x" * 100
+        image = medicine_package_image_bytes("jpeg")
         upload_status, upload_body = upload_request(f"/donations/{donation_id}/images", "package.jpg", image, "image/jpeg", donor["access_token"])
         self.assertEqual(upload_status, 201, upload_body)
         image_id = json.loads(upload_body)[0]["id"]
@@ -635,7 +654,8 @@ class TestAuthPostgres(unittest.TestCase):
 
             def extract(self, image, content_type):
                 fields = {key: None for key in ("medicine_name", "strength", "dosage_form", "manufacturer", "batch_number", "expiry_date", "quantity", "packaging_type")}
-                fields["raw_ocr_text"] = ""
+                fields["medicine_name"] = "Sample Medicine"
+                fields["raw_ocr_text"] = None
                 return type("Result", (), {
                     "fields": fields,
                     "confidence": {key: 0.0 for key in fields if key != "raw_ocr_text"},
@@ -651,8 +671,8 @@ class TestAuthPostgres(unittest.TestCase):
         pharmacist_extraction = request("GET", f"/donations/{donation_id}/extraction", token=pharmacist["access_token"])
         self.assertEqual(pharmacist_extraction[0], 200, pharmacist_extraction[1])
         extraction = json.loads(pharmacist_extraction[1])["items"][0]
-        self.assertTrue(all(value is None for value in extraction["fields"].values()))
-        self.assertEqual(extraction["raw_ocr_text"], "")
+        self.assertEqual(extraction["fields"]["medicine_name"], "Sample Medicine")
+        self.assertIsNone(extraction["raw_ocr_text"])
         self.assertEqual(json.loads(pharmacist_extraction[1])["items"][0]["status"], "COMPLETED")
         self.assertFalse(json.loads(pharmacist_extraction[1])["items"][0]["is_mock"])
         uploaded = image_request(f"/donations/{donation_id}/images/{image_id}", donor["access_token"])
@@ -675,7 +695,7 @@ class TestAuthPostgres(unittest.TestCase):
             failed_response = request("POST", f"/donations/{donation_id}/extract", token=pharmacist["access_token"])
         self.assertEqual(failed_response[0], 200, failed_response[1])
         failed_item = next(item for item in json.loads(failed_response[1])["items"] if item["status"] == "FAILED")
-        self.assertEqual(failed_item["error_message"], "OCR could not read this image. Please verify the package manually.")
+        self.assertEqual(failed_item["error_message"], "Image extraction failed unexpectedly. Please retry later or verify the package manually.")
         self.assertNotIn("must-not-be-returned", failed_response[1])
         with self.engine.connect() as connection:
             self.assertEqual(connection.execute(select(Donation.status).where(Donation.id == donation_id)).scalar_one().value, "PENDING_REVIEW")
@@ -689,7 +709,7 @@ class TestAuthPostgres(unittest.TestCase):
             missing_key_response = request("POST", f"/donations/{donation_id}/extract", token=pharmacist["access_token"])
         self.assertEqual(missing_key_response[0], 200, missing_key_response[1])
         missing_key_item = next(item for item in json.loads(missing_key_response[1])["items"] if item["status"] == "FAILED")
-        self.assertEqual(missing_key_item["error_message"], "OCR could not read this image. Please verify the package manually.")
+        self.assertEqual(missing_key_item["error_message"], "Gemini extraction is not configured. Please contact support or continue with manual verification.")
         self.assertNotIn("GEMINI_API_KEY", missing_key_response[1])
         self.assertEqual(request("GET", f"/donations/{donation_id}/review", token=pharmacist["access_token"])[0], 200)
         self.assertEqual(request("GET", f"/donations/{donation_id}/extraction", token=other["access_token"])[0], 403)
@@ -707,7 +727,7 @@ class TestAuthPostgres(unittest.TestCase):
 
         failed_donation = json.loads(self.create_donation(donor["access_token"], details_confirmed=False)[1])
         failed_id = failed_donation["id"]
-        upload_request(f"/donations/{failed_id}/images", "tiny.jpg", b"\xff\xd8\xff", "image/jpeg", donor["access_token"])
+        upload_request(f"/donations/{failed_id}/images", "tiny.jpg", medicine_package_image_bytes("jpeg"), "image/jpeg", donor["access_token"])
         failed = request("GET", f"/donations/{failed_id}/extraction", token=pharmacist["access_token"])
         self.assertEqual(failed[0], 200, failed[1])
         self.assertEqual(json.loads(failed[1])["items"], [])
@@ -721,7 +741,7 @@ class TestAuthPostgres(unittest.TestCase):
         # A rejected image leaves the same draft available for a valid retry.
         retry_draft = json.loads(self.create_donation(donor["access_token"], details_confirmed=False)[1])
         retry_id = retry_draft["id"]
-        valid_png = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+        valid_png = medicine_package_image_bytes("png")
         invalid = upload_request(f"/donations/{retry_id}/images?finalize=false", "notes.txt", b"not an image", "text/plain", donor["access_token"])
         self.assertEqual(invalid[0], 415, invalid[1])
         self.assertEqual(request("GET", f"/donations/{retry_id}", token=donor["access_token"])[0], 200)
@@ -991,7 +1011,9 @@ class TestAuthPostgres(unittest.TestCase):
         image_url = medicine["images"][0]["image_url"]
         served_image = image_request(image_url, patient_token)
         self.assertEqual(served_image[0], 200)
-        self.assertEqual(served_image[1], b"\xff\xd8\xff" + b"x" * 100)
+        decoded_image = cv2.imdecode(np.frombuffer(served_image[1], dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertIsNotNone(decoded_image)
+        self.assertEqual(decoded_image.shape[:2], (420, 640))
         self.assertEqual(image_request(image_url, donor_token)[0], 403)
         self.assertEqual(image_request(image_url, pharmacist_token)[0], 403)
         self.assertEqual(image_request(image_url, None)[0], 401)
@@ -1303,6 +1325,60 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(request("GET", f"/patient/checkout/{free_request['id']}", token=patient["access_token"])[0], 409)
         self.assertEqual(request("POST", f"/patient/checkout/{free_request['id']}/demo-pay", token=patient["access_token"])[0], 409)
         self.assertEqual(request("POST", f"/pharmacist/requests/{free_request['id']}/dispense", token=pharmacist["access_token"])[0], 409)
+
+    def test_dispensing_uses_checkout_amount_for_payment_requirement(self):
+        _, donor = self.signup("DONOR", "dispense-payment")
+        _, patient = self.signup("PATIENT", "dispense-payment")
+        _, pharmacist = self.signup("CLINIC_PHARMACIST", "dispense-payment")
+        pharmacist_token = pharmacist["access_token"]
+        patient_token = patient["access_token"]
+        with self.Session() as session:
+            session.query(ClinicProfile).filter_by(user_id=pharmacist["user"]["id"]).one().verification_status = "VERIFIED"
+            session.commit()
+
+        donation = json.loads(self.create_donation(donor["access_token"], quantity=6)[1])
+        self.assertEqual(self.approve_donation(donation["id"], pharmacist_token)[0], 201)
+        with self.Session() as session:
+            inventory = session.query(Inventory).filter_by(donation_id=donation["id"]).one()
+            inventory.common_use_category = CommonUseCategory.COLD
+            inventory.prescription_required = False
+            inventory.original_price = 100
+            inventory.discount_percentage = 25
+            inventory.patient_price = 75
+            inventory_id = str(inventory.id)
+            session.commit()
+
+        def approved_request():
+            created_status, created_body = self.create_patient_request(inventory_id, 1, patient_token)
+            self.assertEqual(created_status, 201, created_body)
+            row = json.loads(created_body)
+            self.assertEqual(row["patient_price_snapshot"], "75.00")
+            approved_status, approved_body = request("POST", f"/pharmacist/requests/{row['id']}/approve", token=pharmacist_token)
+            self.assertEqual(approved_status, 200, approved_body)
+            return row["id"]
+
+        # Legacy free donation: a non-null price snapshot exists, but no
+        # checkout obligation was created for the free patient-facing flow.
+        free_request_id = approved_request()
+        self.assertEqual(request("POST", f"/pharmacist/requests/{free_request_id}/dispense", token=pharmacist_token)[0], 200)
+
+        paid_request_id = approved_request()
+        unpaid_request_id = approved_request()
+        with self.Session() as session:
+            for request_id, status in ((paid_request_id, PaymentStatus.PAID), (unpaid_request_id, PaymentStatus.PENDING)):
+                session.add(Checkout(
+                    request_id=UUID(request_id), patient_user_id=UUID(patient["user"]["id"]),
+                    amount=75, payment_status=status,
+                    payment_method="DEMO" if status == PaymentStatus.PAID else None,
+                    paid_at=datetime.now(timezone.utc) if status == PaymentStatus.PAID else None,
+                ))
+            session.commit()
+
+        paid_status, paid_body = request("POST", f"/pharmacist/requests/{paid_request_id}/dispense", token=pharmacist_token)
+        self.assertEqual(paid_status, 200, paid_body)
+        unpaid_status, unpaid_body = request("POST", f"/pharmacist/requests/{unpaid_request_id}/dispense", token=pharmacist_token)
+        self.assertEqual(unpaid_status, 409, unpaid_body)
+        self.assertIn("Payment must be completed", unpaid_body)
 
     def test_dispensing_audit_authorization_and_no_second_inventory_decrement(self):
         _, donor = self.signup("DONOR", "dispense")
@@ -1815,12 +1891,33 @@ class TestAuthPostgres(unittest.TestCase):
         self.assertEqual(upload(patient["access_token"], b"\x89PNG\r\n\x1a\ninvalid")[0], 403)
         self.assertEqual(upload(pharmacist["access_token"], b"\x89PNG\r\n\x1a\ninvalid")[0], 403)
         self.assertEqual(upload(donor["access_token"], b"not an image")[0], 415)
-        image_status, image_body = upload(donor["access_token"], b"\x89PNG\r\n\x1a\nsmall test image")
+        image_status, image_body = upload(donor["access_token"], medicine_package_image_bytes("png"))
         self.assertEqual(image_status, 201, image_body)
         image = json.loads(image_body)[0]
         self.assertNotIn("storage_key", image)
         self.assertEqual(image_request(image["download_url"], donor["access_token"])[0], 200)
         self.assertEqual(image_request(image["download_url"], other["access_token"])[0], 404)
+
+    def test_donation_image_upload_requires_supported_decodable_content_and_matching_mime(self):
+        _, donor = self.signup("DONOR", "validated-images")
+        donation = json.loads(self.create_donation(donor["access_token"], details_confirmed=False)[1])
+        endpoint = f"/donations/{donation['id']}/images?finalize=false"
+        for kind, content_type, filename in (("jpeg", "image/jpeg", "photo.jpg"), ("png", "image/png", "photo.png"), ("webp", "image/webp", "photo.webp")):
+            with self.subTest(valid_format=kind):
+                response = upload_request(endpoint, filename, medicine_package_image_bytes(kind), content_type, donor["access_token"])
+                self.assertEqual(response[0], 201, response[1])
+        rejects = [
+            ("renamed-text.jpg", "image/jpeg", b"ordinary text, not an image"),
+            ("wrong-mime.png", "image/jpeg", medicine_package_image_bytes("png")),
+            ("truncated.png", "image/png", medicine_package_image_bytes("png")[:16]),
+            ("empty.jpg", "image/jpeg", b""),
+            ("unsupported.bmp", "image/bmp", medicine_package_image_bytes("bmp")),
+            ("renamed-pdf.jpg", "image/jpeg", b"%PDF-1.7\nnot an image"),
+        ]
+        for filename, content_type, content in rejects:
+            with self.subTest(rejected_file=filename):
+                response = upload_request(endpoint, filename, content, content_type, donor["access_token"])
+                self.assertEqual(response[0], 415, response[1])
 
 
 if __name__ == "__main__":

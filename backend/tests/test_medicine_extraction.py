@@ -6,8 +6,11 @@ from unittest.mock import patch
 
 from app.services.medicine_extraction import (
     FIELDS,
+    ExtractionConfigurationError,
+    ExtractionProviderError,
     GeminiExtractionProvider,
     PaddleOCRExtractionProvider,
+    UnreadableImageError,
     _map_visible_fields,
     get_extraction_provider,
 )
@@ -46,7 +49,7 @@ class MedicineExtractionProviderTests(unittest.TestCase):
 
     def test_gemini_missing_key_fails_without_disclosing_key(self):
         provider = GeminiExtractionProvider("", "gemini-2.5-flash")
-        with self.assertRaisesRegex(RuntimeError, "GEMINI_API_KEY is not configured") as raised:
+        with self.assertRaisesRegex(ExtractionConfigurationError, "not configured") as raised:
             provider.extract(b"image", "image/png")
         self.assertNotIn("test-key", str(raised.exception))
 
@@ -126,7 +129,7 @@ class MedicineExtractionProviderTests(unittest.TestCase):
             )
         )
         provider = GeminiExtractionProvider("test-key-not-real", "gemini-2.5-flash", fake_client)
-        with self.assertRaisesRegex(RuntimeError, "Gemini could not extract this image"):
+        with self.assertRaisesRegex(ExtractionProviderError, "could not be processed"):
             provider.extract(b"synthetic image bytes", "image/png")
 
     def test_gemini_api_error_does_not_leak_provider_error(self):
@@ -135,9 +138,15 @@ class MedicineExtractionProviderTests(unittest.TestCase):
 
         fake_client = SimpleNamespace(models=SimpleNamespace(generate_content=fail_request))
         provider = GeminiExtractionProvider("test-key-not-real", "gemini-2.5-flash", fake_client)
-        with self.assertRaisesRegex(RuntimeError, "Gemini could not extract this image") as raised:
+        with self.assertRaisesRegex(ExtractionProviderError, "temporarily unavailable") as raised:
             provider.extract(b"synthetic image bytes", "image/png")
         self.assertNotIn("test-key-not-real", str(raised.exception))
+        self.assertNotIn("quota failure", str(raised.exception))
+
+    def test_gemini_rejects_empty_or_unsupported_image_as_unreadable(self):
+        provider = GeminiExtractionProvider("test-key-not-real", "gemini-2.5-flash")
+        with self.assertRaisesRegex(UnreadableImageError, "unsupported format"):
+            provider.extract(b"", "image/png")
 
     def test_maps_only_visible_text_with_confidence(self):
         lines = [

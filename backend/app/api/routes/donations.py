@@ -14,7 +14,12 @@ from app.models import Donation, DonationImage, DonationReview, DonationStatus, 
 from app.schemas.donation import DonationCreate, DonationImageResponse, DonationResponse, DonationReviewCreate, DonationReviewResponse, DonorDonationResponse
 from app.services.donation_storage import LocalDonationStorage
 from app.services.donation_image_screening import screen_medicine_photo
-from app.services.medicine_extraction import ExtractionConfigurationError, get_extraction_provider
+from app.services.medicine_extraction import (
+    ExtractionConfigurationError,
+    ExtractionProviderError,
+    UnreadableImageError,
+    get_extraction_provider,
+)
 from app.models import ClinicProfile, ClinicVerificationStatus
 from datetime import date, datetime, timezone
 from app.models import CommonUseCategory, NotificationType, prescription_required_for
@@ -25,6 +30,7 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 IMAGE_EXTENSIONS = {"jpeg": ".jpg", "png": ".png", "webp": ".webp"}
 IMAGE_CONTENT_TYPES = {"jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+UNREADABLE_IMAGE_MESSAGE = "OCR could not read this image. Upload a sharper, well-lit photo showing the medicine name, strength, batch number, and expiry date, or verify the package manually."
 storage = LocalDonationStorage()
 
 
@@ -104,16 +110,30 @@ def _extract_images(donation: Donation, images: list[DonationImage], db: Session
         try:
             content = storage.read(image.storage_key)
             if len(content) < 64 or detect_image_type(content) is None:
-                raise RuntimeError("Invalid image")
+                raise UnreadableImageError(UNREADABLE_IMAGE_MESSAGE)
             result = provider.extract(content, image.content_type)
+            if not any(result.fields.get(field) is not None for field in (
+                "medicine_name", "strength", "dosage_form", "manufacturer",
+                "batch_number", "expiry_date", "quantity", "packaging_type",
+            )):
+                raise UnreadableImageError(UNREADABLE_IMAGE_MESSAGE)
             record.extracted_fields = result.fields
             record.confidence = {**result.confidence, "overall_confidence": result.overall_confidence}
             record.status = ExtractionStatus.COMPLETED
             record.provider_name = result.provider
             record.provider_version = result.version
+        except ExtractionConfigurationError as exc:
+            record.status = ExtractionStatus.FAILED
+            record.error_message = str(exc)
+        except ExtractionProviderError as exc:
+            record.status = ExtractionStatus.FAILED
+            record.error_message = str(exc)
+        except UnreadableImageError as exc:
+            record.status = ExtractionStatus.FAILED
+            record.error_message = str(exc)
         except Exception:
             record.status = ExtractionStatus.FAILED
-            record.error_message = "OCR could not read this image. Please verify the package manually."
+            record.error_message = "Image extraction failed unexpectedly. Please retry later or verify the package manually."
         record.completed_at = datetime.now(timezone.utc)
     db.commit()
 

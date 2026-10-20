@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { CalendarDays, ImageOff, MapPin, PackageCheck, Search, ShieldCheck, Upload, X } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import { ArrowLeft, ArrowUpRight, ClipboardList, ImageOff, MapPin, PackageCheck, Pill, Search, ShieldCheck, Upload, X } from 'lucide-react'
 import { API_BASE_URL } from './config'
 import { safeApiErrorMessage } from './apiErrors.mjs'
+import { HelpingHands } from './HelpingHands'
+import Notifications from './Notifications'
+import './patient-dashboard.css'
 
 type Medicine = {
   medicine_id: string
@@ -13,9 +17,6 @@ type Medicine = {
   clinic_name: string
   clinic_city: string
   prescription_required: boolean
-  original_price: string | null
-  discount_percentage: string | null
-  patient_price: string | null
   images: { image_url: string }[]
 }
 type PageResult = { items: Medicine[]; total: number; page: number; page_size: number }
@@ -28,32 +29,13 @@ type MedicineRequest = {
   unit: string
   pickup_address: string | null
   status: string
+  rejection_reason: string | null
   created_at: string
   fulfilled_at: string | null
   pickup_code: string | null
   prescription_required: boolean | null
   prescription_status: string | null
   prescription_rejection_reason: string | null
-  price_original_snapshot: string | null
-  discount_snapshot: string | null
-  patient_price_snapshot: string | null
-  payment_status: string | null
-}
-type Checkout = {
-  request_id: string
-  medicine_name: string
-  quantity: number
-  unit: string
-  clinic_name: string
-  original_price: string
-  discount_percentage: string
-  patient_price: string
-  amount: string
-  currency: string
-  payment_status: string
-  payment_method: string | null
-  is_free: boolean
-  demo_payment: boolean
 }
 
 const categoryLabels: Record<string, string> = {
@@ -73,12 +55,7 @@ function categoryLabel(category: string) {
   return categoryLabels[category] ?? 'Unclassified'
 }
 
-function priceLabel(medicine: Medicine) {
-  if (medicine.original_price === null || medicine.patient_price === null) return 'Price not configured'
-  return Number(medicine.patient_price) === 0 ? 'Free' : `₹${medicine.patient_price}`
-}
-
-export default function PatientDiscovery({ token, onLogout }: { token: string; onLogout: () => void }) {
+export default function PatientDiscovery({ token, userName, onLogout }: { token: string; userName: string; onLogout: () => void }) {
   const [name, setName] = useState('')
   const [category, setCategory] = useState('')
   const [city, setCity] = useState('')
@@ -100,10 +77,15 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
   const [prescriptionFiles, setPrescriptionFiles] = useState<Record<string, File | undefined>>({})
   const [requestFiles, setRequestFiles] = useState<Record<string, File | undefined>>({})
   const [fileError, setFileError] = useState('')
-  const [checkouts, setCheckouts] = useState<Record<string, Checkout>>({})
-  const [checkoutBusy, setCheckoutBusy] = useState<string | null>(null)
   const [imageUrls, setImageUrls] = useState<Record<string, string>>({})
+  const [imageFailures, setImageFailures] = useState<Record<string, boolean>>({})
   const [selectedMedicine, setSelectedMedicine] = useState<Medicine | null>(null)
+  const [lightbox, setLightbox] = useState<{ medicineName: string; url: string } | null>(null)
+  const [pickupDate, setPickupDate] = useState(() => {
+    const tomorrow = new Date()
+    tomorrow.setDate(tomorrow.getDate() + 1)
+    return `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`
+  })
 
   useEffect(() => {
     const controller = new AbortController()
@@ -143,6 +125,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
     const controller = new AbortController()
     const objectUrls: string[] = []
     setImageUrls({})
+    setImageFailures({})
 
     const images = result?.items.flatMap((medicine) => {
       const image = medicine.images[0]
@@ -155,9 +138,15 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
           headers: { Authorization: `Bearer ${token}` },
           signal: controller.signal,
         })
-        if (!response.ok) return
+        if (!response.ok) {
+          setImageFailures((current) => ({ ...current, [key]: true }))
+          return
+        }
         const blob = await response.blob()
-        if (!blob.type.startsWith('image/')) return
+        if (!blob.type.startsWith('image/')) {
+          setImageFailures((current) => ({ ...current, [key]: true }))
+          return
+        }
         const objectUrl = URL.createObjectURL(blob)
         if (controller.signal.aborted) {
           URL.revokeObjectURL(objectUrl)
@@ -166,7 +155,7 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
         objectUrls.push(objectUrl)
         setImageUrls((current) => ({ ...current, [key]: objectUrl }))
       } catch {
-        // Keep the package-photo placeholder when the protected image is unavailable.
+        if (!controller.signal.aborted) setImageFailures((current) => ({ ...current, [key]: true }))
       }
     }))
 
@@ -358,43 +347,42 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
     }
   }
 
-  async function openCheckout(item: MedicineRequest, pay = false) {
-    setCheckoutBusy(item.id)
-    setRequestMessage('')
-    try {
-      const response = await fetch(`${API_BASE_URL}/patient/checkout/${item.id}${pay ? '/demo-pay' : ''}`, {
-        method: pay ? 'POST' : 'GET',
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      const body = await response.json() as Checkout & { detail?: string }
-      if (!response.ok) throw new Error(safeApiErrorMessage(body, 'Could not open checkout.'))
-      setCheckouts((current) => ({ ...current, [item.id]: body }))
-      if (pay) {
-        setRequestMessage('Your demo payment was recorded. No real money was charged.')
-        await loadRequests()
-      }
-    } catch (cause) {
-      setRequestMessage(cause instanceof Error ? cause.message : 'Could not open checkout.')
-    } finally {
-      setCheckoutBusy(null)
-    }
-  }
-
   const filterActive = Boolean(name || category || city || clinic)
 
-  return <div className="mt-8 text-left">
-    <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ea] pb-5">
-      <div>
-        <p className="text-xs font-semibold uppercase tracking-[.12em] text-[#71886d]">Patient medicine discovery</p>
-        <h2 className="mt-1 text-2xl font-semibold tracking-tight">Find available medicines</h2>
-        <p className="mt-1 text-sm text-[#718078]">Pharmacist-reviewed medicines from verified clinics.</p>
-      </div>
-      <button onClick={onLogout} className="rounded-full border border-[#dce4d9] px-4 py-2 text-sm font-semibold hover:border-[#174e3f]">Log out</button>
-    </div>
+  useEffect(() => {
+    if (!selectedMedicine && !lightbox) return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      if (lightbox) setLightbox(null)
+      else setSelectedMedicine(null)
+    }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [selectedMedicine, lightbox])
 
-    <div className="mb-6 flex flex-wrap gap-2">
-      <button onClick={() => setTab('search')} className={`rounded-full px-4 py-2 text-sm font-semibold ${tab === 'search' ? 'bg-[#174e3f] text-white' : 'border border-[#dce4d9]'}`}>Find medicine</button>
-      <button onClick={() => void loadRequests()} className={`rounded-full px-4 py-2 text-sm font-semibold ${tab === 'requests' ? 'bg-[#174e3f] text-white' : 'border border-[#dce4d9]'}`}>My Requests</button>
+  return <div className={`patient-workspace${lightbox ? ' patient-lightbox-open' : ''}${selectedMedicine ? ' patient-request-open' : ''}`}>
+    <aside className="patient-sidebar">
+      <a className="patient-logo" href="#patient-dashboard" aria-label="MedShare AI patient dashboard"><span className="patient-logo-mark">♡</span><span>MedShare<span> AI</span></span></a>
+      <div className="patient-account"><p className="patient-eyebrow">Patient</p><p>{userName}</p></div>
+      <nav className="patient-nav" aria-label="Patient dashboard sections">
+        <button type="button" aria-current={tab === 'search' ? 'page' : undefined} className={tab === 'search' ? 'is-active' : ''} onClick={() => setTab('search')}><Search size={16} />Find medicine</button>
+        <button type="button" aria-current={tab === 'requests' ? 'page' : undefined} className={tab === 'requests' ? 'is-active' : ''} onClick={() => void loadRequests()}><ClipboardList size={16} />My Requests</button>
+      </nav>
+      <div className="patient-sidebar-foot"><div className="patient-sidebar-art"><HelpingHands /></div><p>A little care.<br />A lasting difference.</p><button type="button" onClick={onLogout} className="patient-logout"><ArrowLeft size={14} /> Log out</button></div>
+    </aside>
+    <main id="patient-dashboard" className="patient-main"><div className="patient-inner">
+    <div className="patient-topbar"><span className="patient-preview-stamp">Patient dashboard</span><span>Care connects us.</span></div>
+    <div className="patient-heading-row mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ea] pb-5">
+      <div>
+        <p className="patient-header-eyebrow">Patient / MedShare community</p>
+        <h1 className="patient-page-title">{tab === 'search' ? 'Find medicine' : 'My Requests'}</h1>
+      </div>
+      <div className="clinic-heading-actions patient-heading-actions"><Notifications token={token} /><div className="clinic-user-chip"><span>{userName.slice(0, 1).toUpperCase()}</span><span className="clinic-chip-copy">{userName}</span></div></div>
     </div>
 
     {tab === 'requests' ? <>
@@ -402,9 +390,6 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
       {fileError && <p role="alert" className="mb-4 text-sm text-red-700">{fileError}</p>}
       {requestsLoading ? <p className="py-10 text-center text-sm text-[#718078]">Loading your requests…</p> : requests.length ? <div className="space-y-3">
         {requests.map((item) => {
-          const checkout = checkouts[item.id]
-          const paymentStatus = checkout?.payment_status ?? item.payment_status
-          const free = Number(item.patient_price_snapshot) === 0
           return <article key={item.id} className="rounded-2xl border border-[#e4e9e0] bg-white p-4 sm:p-5">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0">
@@ -414,34 +399,19 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
                 {item.pickup_address && <p className="mt-1 text-sm text-[#718078]">Pickup address: {item.pickup_address}</p>}
                 <p className="mt-1 text-xs text-[#87938a]">Requested {new Date(item.created_at).toLocaleString()}</p>
                 <p className="mt-3 text-sm">Prescription: {item.prescription_required === false ? 'Not required' : (item.prescription_status ?? 'Approved doctor prescription required')}</p>
+                {item.rejection_reason && <p className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-800">Clinic response: {item.rejection_reason}</p>}
+                {item.prescription_rejection_reason && <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">Prescription feedback: {item.prescription_rejection_reason}</p>}
                 {item.prescription_required === true && (!item.prescription_status || item.prescription_status === 'REJECTED') && <div className="mt-3 flex flex-wrap items-center gap-2">
                   <input type="file" accept="application/pdf,image/jpeg,image/png" aria-label="Choose prescription file" onChange={(event) => selectPrescription(event.target.files?.[0], item.id, 'existing')} className="max-w-full text-xs" />
                   <button disabled={!requestFiles[item.id] || requestBusy === item.id} onClick={() => void uploadForRequest(item)} className={`${buttonClass} px-3 py-2 text-xs`}>Upload prescription</button>
                   {requestFiles[item.id] && <span className="text-xs text-[#718078]">{requestFiles[item.id]?.name}</span>}
                 </div>}
-                {item.patient_price_snapshot !== null && <p className="mt-3 text-sm">
-                  Price: <span className="font-semibold">{free ? 'Free' : `₹${item.patient_price_snapshot} each`}</span>
-                  {' · '}Payment: <span className="font-semibold">{free ? 'Free' : paymentStatus ?? 'Not started'}</span>
-                </p>}
-                {item.patient_price_snapshot === null && <p className="mt-3 text-sm text-[#718078]">Price was not configured for this request.</p>}
+                <p className="mt-3 text-sm font-medium text-[#416b43]">Donated medicine - Free of charge</p>
                 {item.status === 'APPROVED' && <div className="mt-3 rounded-xl border border-[#dce9d6] bg-[#f5f9f2] p-3 text-sm">
                   <p className="flex items-center gap-2 font-semibold text-[#174e3f]"><PackageCheck size={16} /> Ready for pickup</p>
                   <p className="mt-1">Reserved: {item.requested_quantity} {item.unit}</p>
                   {item.pickup_code && <p>Pickup code: <span className="font-mono font-bold tracking-wider">{item.pickup_code}</span></p>}
-                  {item.patient_price_snapshot === null
-                    ? <p className="mt-2 text-amber-800">Checkout is unavailable because no price was configured.</p>
-                    : <button disabled={checkoutBusy === item.id} onClick={() => void openCheckout(item)} className={`${buttonClass} mt-3 px-3 py-2 text-xs`}>
-                      {checkout?.is_free ? 'Free — no payment required' : paymentStatus === 'PAID' ? 'Payment recorded' : 'View payment details'}
-                    </button>}
-                  {checkout && <div className="mt-3 rounded-xl border border-[#dce9d6] bg-white p-3">
-                    <p className="font-semibold">Checkout details</p>
-                    <p className="mt-1">{checkout.quantity} {checkout.unit} · {checkout.is_free ? 'Free' : `₹${checkout.amount} total`}</p>
-                    <p>Payment status: {checkout.is_free ? 'Free — no payment required' : checkout.payment_status}</p>
-                    {!checkout.is_free && checkout.payment_status !== 'PAID' && <button disabled={checkoutBusy === item.id} onClick={() => void openCheckout(item, true)} className={`${buttonClass} mt-3 px-3 py-2 text-xs`}>
-                      {checkoutBusy === item.id ? 'Processing…' : 'Complete demo payment'}
-                    </button>}
-                    <p className="mt-2 text-xs text-[#718078]">Prototype payment flow; no real money is charged.</p>
-                  </div>}
+                  <p className="mt-2">This donated medicine is free of charge. Contact the clinic for pickup details.</p>
                 </div>}
                 {item.status === 'FULFILLED' && <div className="mt-3 rounded-xl bg-[#f5f7f2] p-3 text-sm">
                   <p className="font-semibold">Fulfilled</p>
@@ -457,25 +427,28 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
         })}
       </div> : <div className="rounded-2xl border border-dashed border-[#dce4d9] px-5 py-9 text-center text-sm text-[#718078]">No medicine requests yet.</div>}
     </> : <>
-      <p className="mb-5 max-w-3xl text-sm leading-6 text-[#718078]">Browse available stock reviewed by clinic pharmacists. Common-use categories are not diagnoses or treatment recommendations.</p>
-      <div className="grid gap-3 rounded-2xl border border-[#e4e9e0] bg-[#fbfcfa] p-4 sm:grid-cols-2 lg:grid-cols-3">
-        <label className="relative sm:col-span-2 lg:col-span-3">
-          <Search size={17} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#87938a]" />
-          <input className={`${inputClass} pl-10`} value={name} onChange={(event) => changeFilter(setName, event.target.value)} placeholder="Search medicine name" aria-label="Search medicine name" />
+      <p className="patient-search-intro">A little support, close to home. Browse available stock checked by clinic pharmacists. Common-use categories are not diagnoses or treatment recommendations.</p>
+      <div className="patient-filter-grid grid gap-3 rounded-2xl border border-[#e4e9e0] bg-[#fbfcfa] p-4 sm:grid-cols-2 lg:grid-cols-3">
+        <label className="patient-filter-search relative">
+          <span>Search</span><Search size={17} className="absolute left-3.5 top-[42px] -translate-y-1/2 text-[#87938a]" />
+          <input className={`${inputClass} mt-1.5 pl-10`} value={name} onChange={(event) => changeFilter(setName, event.target.value)} placeholder="Search medicine name" aria-label="Search medicine name" />
         </label>
-        <label className="text-xs font-semibold text-[#55704f]">Common-use category
+        <label className="patient-filter-field text-xs font-semibold text-[#55704f]">Common-use category
           <select className={`${inputClass} mt-1.5`} value={category} onChange={(event) => changeFilter(setCategory, event.target.value)}>
             <option value="">All categories</option>
             {Object.entries(categoryLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
         </label>
-        <label className="text-xs font-semibold text-[#55704f]">Clinic city
+        <label className="patient-filter-field text-xs font-semibold text-[#55704f]">Clinic city
           <input className={`${inputClass} mt-1.5`} value={city} onChange={(event) => changeFilter(setCity, event.target.value)} placeholder="Filter by city" aria-label="Filter by clinic city" />
         </label>
-        <label className="text-xs font-semibold text-[#55704f]">Clinic
-          <input className={`${inputClass} mt-1.5`} value={clinic} onChange={(event) => changeFilter(setClinic, event.target.value)} placeholder="Filter by clinic name" aria-label="Filter by clinic name" />
-        </label>
-        <div className="flex items-end justify-between gap-3 sm:col-span-2 lg:col-span-3">
+        <details className="patient-more-filters" open={Boolean(clinic)}>
+          <summary>More filters{clinic ? ' · Clinic selected' : ''}</summary>
+          <label className="patient-clinic-filter">Clinic
+            <input className={`${inputClass} mt-1.5`} value={clinic} onChange={(event) => changeFilter(setClinic, event.target.value)} placeholder="Filter by clinic name" aria-label="Filter by clinic name" />
+          </label>
+        </details>
+        <div className="patient-filter-actions flex items-end justify-between gap-3 sm:col-span-2 lg:col-span-3">
           <p className="rounded-full bg-[#edf5e9] px-3 py-2 text-xs font-semibold text-[#416b43]">Availability: Available now</p>
           <button onClick={clearFilters} disabled={!filterActive} className="rounded-full border border-[#dce4d9] px-4 py-2 text-sm font-semibold text-[#55704f] disabled:opacity-50">Clear filters</button>
         </div>
@@ -488,32 +461,22 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
           <p className="flex items-center gap-1.5 text-xs text-[#718078]"><ShieldCheck size={14} /> Approved donations · verified clinics · in-date stock</p>
         </div>
         {result.items.length ? <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {result.items.map((item) => {
+          {result.items.map((item, index) => {
             const image = item.images[0]
             const imageKey = image ? `${item.medicine_id}:${image.image_url}` : ''
             const imageUrl = imageUrls[imageKey]
             const prescription = item.prescription_required === true
-            return <article key={item.medicine_id} className="flex flex-col overflow-hidden rounded-2xl border border-[#e4e9e0] bg-white shadow-sm transition hover:-translate-y-0.5 hover:shadow-md">
-              <div className="relative isolate flex h-44 w-full shrink-0 items-center justify-center overflow-hidden bg-[#f3f6f1]">
-                {imageUrl ? <img className="block max-h-full max-w-full object-contain p-3" src={imageUrl} alt={`${item.medicine_name} package`} /> : <div className="flex flex-col items-center gap-2 text-[#9aa79a]"><ImageOff size={30} /><span className="text-xs">Package photo unavailable</span></div>}
-              </div>
-              <div className="relative z-0 min-w-0 flex-1 bg-white p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <h3 className="truncate text-lg font-semibold">{item.medicine_name}</h3>
-                    <p className="mt-1 text-sm text-[#55704f]">Common use: {categoryLabel(item.common_use_category)}</p>
-                  </div>
-                  <span className="shrink-0 rounded-full bg-[#edf5e9] px-2.5 py-1 text-xs font-semibold text-[#416b43]">Available</span>
-                </div>
-                <p className="mt-3 flex items-center gap-1.5 text-sm text-[#718078]"><MapPin size={15} />{item.clinic_name} · {item.clinic_city}</p>
-                <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
-                  <p className="flex items-center gap-1.5 text-[#718078]"><CalendarDays size={15} />Expires {new Date(`${item.expiry_date}T00:00:00`).toLocaleDateString()}</p>
-                  <p className="text-right font-medium">{item.availability} {item.availability_unit} available</p>
-                </div>
-                <p className="mt-3 text-sm font-semibold">{priceLabel(item)}{Number(item.patient_price) > 0 ? ' each' : ''}</p>
-                {prescription && <p className="mt-2 text-xs font-medium text-amber-800">Doctor prescription required</p>}
-                <button onClick={() => setSelectedMedicine(item)} className={`${buttonClass} mt-4 w-full`}>View details / Request medicine</button>
-              </div>
+            return <article key={item.medicine_id} className="patient-medicine-card" style={{ animationDelay: `${index * 45}ms` }}>
+              <div className="patient-card-head"><div className="patient-medicine-drawing">
+                {imageUrl ? <button type="button" className="patient-image-open" aria-label={`Enlarge ${item.medicine_name} package image`} onClick={() => setLightbox({ medicineName: item.medicine_name, url: imageUrl })}><img src={imageUrl} alt={`${item.medicine_name} package`} onError={() => {
+                  setImageFailures((current) => ({ ...current, [imageKey]: true }))
+                  setImageUrls((current) => { const next = { ...current }; delete next[imageKey]; return next })
+                }} /></button> : image && !imageFailures[imageKey] ? <span className="patient-image-loading"><Pill size={24} strokeWidth={1.25} aria-hidden="true" />Loading package photo…</span> : <span className="patient-image-unavailable"><ImageOff size={24} aria-hidden="true" />Package photo unavailable</span>}
+              </div><div className="patient-card-amount"><span className="patient-card-price">Free</span><small>Donated medicine</small></div></div>
+              <p className="patient-category">{categoryLabel(item.common_use_category)}</p>
+              <h2>{item.medicine_name}</h2>
+              <p className="patient-clinic"><MapPin size={14} />{item.clinic_name} · {item.clinic_city}</p>
+              <div className="patient-medicine-bottom"><span>{item.availability} {item.availability_unit}<small>Expires {new Date(`${item.expiry_date}T00:00:00`).toLocaleDateString()}</small>{prescription && <small className="patient-rx-note">Prescription required</small>}</span><button type="button" onClick={() => setSelectedMedicine(item)} className="patient-button patient-button-primary">Request<ArrowUpRight size={14} /></button></div>
             </article>
           })}
         </div> : <div className="rounded-2xl border border-dashed border-[#dce4d9] px-5 py-10 text-center">
@@ -532,15 +495,15 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
 
     {tab === 'search' && requestMessage && <p role="status" className="mt-4 rounded-xl bg-[#f5f7f2] px-4 py-3 text-sm">{requestMessage}</p>}
 
-    {selectedMedicine && <div className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-[#153b31]/45 p-3 sm:p-4" onMouseDown={(event) => {
+    {selectedMedicine && createPortal(<div className="patient-request-backdrop" onMouseDown={(event) => {
       if (event.target === event.currentTarget) setSelectedMedicine(null)
     }}>
-      <section role="dialog" aria-modal="true" aria-labelledby="medicine-detail-title" className="flex max-h-[calc(100dvh-1.5rem)] w-full max-w-2xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl sm:max-h-[calc(100dvh-2rem)]">
+      <section role="dialog" aria-modal="true" aria-labelledby="medicine-detail-title" className="patient-request-dialog">
         <div className="flex shrink-0 items-start justify-between gap-4 border-b border-[#edf0ea] p-5 sm:p-7">
           <div className="min-w-0"><p className="text-xs font-semibold uppercase tracking-[.12em] text-[#71886d]">Medicine details</p><h2 id="medicine-detail-title" className="mt-1 break-words text-2xl font-semibold">{selectedMedicine.medicine_name}</h2></div>
           <button onClick={() => setSelectedMedicine(null)} aria-label="Close medicine details" className="shrink-0 rounded-full border border-[#dce4d9] p-2"><X size={18} /></button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5 sm:px-7 sm:pb-7">
+        <div className="patient-request-content min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5 sm:px-7 sm:pb-7">
           {(() => {
           const image = selectedMedicine.images[0]
           const imageKey = image ? `${selectedMedicine.medicine_id}:${image.image_url}` : ''
@@ -549,14 +512,14 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
           const quantity = requestQuantity[selectedMedicine.medicine_id] ?? 1
           return <>
             <div className="mt-5 flex h-48 w-full shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-[#f3f6f1] sm:h-64">
-              {imageUrl ? <img className="block h-full w-full object-contain p-4" src={imageUrl} alt={`${selectedMedicine.medicine_name} package`} /> : <div className="flex flex-col items-center gap-2 text-[#9aa79a]"><ImageOff size={34} /><span className="text-sm">Package photo unavailable</span></div>}
+              {imageUrl ? <button type="button" className="patient-detail-image-open" aria-label={`Enlarge ${selectedMedicine.medicine_name} package image`} onClick={() => setLightbox({ medicineName: selectedMedicine.medicine_name, url: imageUrl })}><img className="block h-full w-full object-contain p-4" src={imageUrl} alt={`${selectedMedicine.medicine_name} package`} /></button> : <div className="flex flex-col items-center gap-2 text-[#9aa79a]"><ImageOff size={34} /><span className="text-sm">Package photo unavailable</span></div>}
             </div>
             <div className="mt-5 min-w-0">
               <div className="grid min-w-0 grid-cols-1 gap-3 min-[420px]:grid-cols-2">
                 <p className="min-w-0 break-words"><span className="text-sm text-[#718078]">Common use</span><br /><span className="font-medium">{categoryLabel(selectedMedicine.common_use_category)}</span></p>
                 <p className="min-w-0 break-words"><span className="text-sm text-[#718078]">Expiry date</span><br /><span className="font-medium">{new Date(`${selectedMedicine.expiry_date}T00:00:00`).toLocaleDateString()}</span></p>
                 <p className="min-w-0 break-words"><span className="text-sm text-[#718078]">Availability</span><br /><span className="font-medium">{selectedMedicine.availability} {selectedMedicine.availability_unit} available</span></p>
-                <p className="min-w-0 break-words"><span className="text-sm text-[#718078]">Price</span><br /><span className="font-medium">{priceLabel(selectedMedicine)}{Number(selectedMedicine.patient_price) > 0 ? ' each' : ''}</span></p>
+                <p className="min-w-0 break-words"><span className="text-sm text-[#718078]">Cost</span><br /><span className="font-medium text-[#416b43]">Free - donated medicine</span></p>
                 <p className="min-w-0 break-words min-[420px]:col-span-2"><span className="text-sm text-[#718078]">Clinic</span><br /><span className="font-medium">{selectedMedicine.clinic_name} · {selectedMedicine.clinic_city}</span></p>
               </div>
               <div className={`mt-4 rounded-xl p-3 text-sm ${prescription ? 'bg-amber-50 text-amber-900' : 'bg-[#edf5e9] text-[#416b43]'}`}>
@@ -573,6 +536,10 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
                   setRequestMessage('')
                 }} placeholder="Where should the clinic prepare this request for pickup?" />
                 <span className="mt-1 block break-words text-xs font-normal text-[#718078]">This address is attached to this request and visible only to you and the responsible clinic.</span>
+              </label>
+              <label className="patient-pickup-date mt-4 block text-sm font-medium">Preferred pickup date
+                <input type="date" min={new Date().toISOString().slice(0, 10)} value={pickupDate} onChange={(event) => setPickupDate(event.target.value)} className={`${inputClass} mt-2`} />
+                <span>This date is for reference only. The current request service does not save or schedule a pickup date.</span>
               </label>
               {prescription && <div className="mt-4">
                 <p className="mb-2 break-words text-sm font-medium">Prescription file <span className="text-red-700">Required</span></p>
@@ -602,6 +569,15 @@ export default function PatientDiscovery({ token, onLogout }: { token: string; o
           })()}
         </div>
       </section>
+    </div>, document.body)}
+    {lightbox && <div className="patient-lightbox" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) setLightbox(null)
+    }}>
+      <section className="patient-lightbox-panel" role="dialog" aria-modal="true" aria-label={`${lightbox.medicineName} package image`}>
+        <button type="button" className="patient-lightbox-close" onClick={() => setLightbox(null)} aria-label="Close enlarged medicine image"><X size={21} /></button>
+        <img src={lightbox.url} alt={`${lightbox.medicineName} medicine package, enlarged`} />
+      </section>
     </div>}
+    </div></main>
   </div>
 }

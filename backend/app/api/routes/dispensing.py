@@ -77,10 +77,12 @@ def dispense_request(request_id: UUID, db: Session = Depends(get_db), pharmacist
         raise HTTPException(status_code=404, detail="Medicine request not found")
     if row.status != MedicineRequestStatus.APPROVED:
         raise HTTPException(status_code=409, detail="Only approved, reserved requests can be dispensed")
-    if row.patient_price_snapshot is not None:
-        payment = db.scalar(select(Checkout).where(Checkout.request_id == row.id).with_for_update())
-        if payment is None or payment.payment_status != PaymentStatus.PAID:
-            raise HTTPException(status_code=409, detail="Payment must be completed before dispensing")
+    payment = db.scalar(select(Checkout).where(Checkout.request_id == row.id).with_for_update())
+    # Checkout.amount records the amount actually due. Price snapshots are
+    # retained for legacy requests and do not by themselves make a donation
+    # payable. A positive checkout remains gated on successful payment.
+    if payment is not None and payment.amount > 0 and payment.payment_status != PaymentStatus.PAID:
+        raise HTTPException(status_code=409, detail="Payment must be completed before dispensing")
     if inventory.status == InventoryStatus.EXPIRED or inventory.expiry_date < business_today():
         raise HTTPException(status_code=409, detail="Expired inventory cannot be dispensed")
     if row.requested_quantity <= 0 or row.pickup_code is None:
