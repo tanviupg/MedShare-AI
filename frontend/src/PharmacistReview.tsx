@@ -8,7 +8,7 @@ type Extraction = { fields: Record<string, string | number | null>; raw_ocr_text
 type ExtractionResponse = { items: Extraction[]; detail?: string }
 type CommonUseCategory = 'COLD' | 'COUGH' | 'FLU' | 'FEVER' | 'PAIN' | 'ALLERGY' | 'OTHER' | 'UNCLASSIFIED'
 type VerifiedDetails = { medicine_name: string; strength: string; dosage_form: string; packaging_type: string; manufacturer: string; batch_number: string; expiry_date: string; quantity: string; unit: string; common_use_category: CommonUseCategory }
-type Donation = { id: string; medicine_name: string | null; strength: string | null; dosage_form: string | null; packaging_type: string | null; manufacturer: string | null; batch_number: string | null; expiry_date: string | null; donor_expiry_date: string | null; pickup_address: string | null; quantity: number | null; unit: string | null; details_confirmed: boolean; status: 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' | 'CANCELLED'; images: Image[] }
+type Donation = { id: string; medicine_name: string | null; strength: string | null; dosage_form: string | null; packaging_type: string | null; manufacturer: string | null; batch_number: string | null; expiry_date: string | null; donor_expiry_date: string | null; business_date: string; expiry_warning_days: number; minimum_remaining_shelf_life_days: number; pickup_address: string | null; quantity: number | null; unit: string | null; details_confirmed: boolean; status: 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' | 'CANCELLED'; images: Image[] }
 const categories: { value: CommonUseCategory; label: string }[] = [
   { value: 'COLD', label: 'Cold' }, { value: 'COUGH', label: 'Cough' }, { value: 'FLU', label: 'Flu' },
   { value: 'FEVER', label: 'Fever' }, { value: 'PAIN', label: 'Pain' }, { value: 'ALLERGY', label: 'Allergy' },
@@ -18,6 +18,7 @@ const inputClass = 'mt-1.5 w-full rounded-xl border border-[#dce4d9] bg-white px
 
 function mapExtractionToVerified(current: VerifiedDetails, fields: Extraction['fields']): VerifiedDetails {
   const value = (field: string) => fields[field] == null ? '' : String(fields[field])
+  const expiry = value('expiry_date')
   return {
     ...current,
     medicine_name: value('medicine_name'),
@@ -25,21 +26,38 @@ function mapExtractionToVerified(current: VerifiedDetails, fields: Extraction['f
     dosage_form: value('dosage_form'),
     manufacturer: value('manufacturer'),
     batch_number: value('batch_number'),
-    expiry_date: value('expiry_date'),
+    expiry_date: /^\d{4}-\d{2}-\d{2}$/.test(expiry) ? expiry : '',
     quantity: value('quantity'),
     packaging_type: value('packaging_type'),
   }
 }
 
 function hasCompleteVerifiedDetails(details: VerifiedDetails): boolean {
-  const today = new Date().toISOString().slice(0, 10)
   return Boolean(
     details.medicine_name.trim()
-    && details.expiry_date >= today
+    && details.expiry_date
     && Number.isInteger(Number(details.quantity))
     && Number(details.quantity) > 0
     && details.unit.trim(),
   )
+}
+
+function dateOnlyDaysRemaining(expiryDate: string, businessDate: string): number | null {
+  const timestamp = (value: string): number | null => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+    if (!match) return null
+    const [, yearText, monthText, dayText] = match
+    const year = Number(yearText)
+    const month = Number(monthText)
+    const day = Number(dayText)
+    const result = Date.UTC(year, month - 1, day)
+    const parsed = new Date(result)
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) return null
+    return result
+  }
+  const expiry = timestamp(expiryDate)
+  const today = timestamp(businessDate)
+  return expiry === null || today === null ? null : Math.round((expiry - today) / 86400000)
 }
 
 export default function PharmacistReview({ token, onReviewComplete }: { token: string; onReviewComplete: () => void }) {
@@ -56,6 +74,9 @@ export default function PharmacistReview({ token, onReviewComplete }: { token: s
   const [extractions, setExtractions] = useState<Extraction[]>([])
   const [verified, setVerified] = useState<VerifiedDetails | null>(null)
   const [physicalChecked, setPhysicalChecked] = useState(false)
+  const verifiedExpiryDays = selected && verified
+    ? dateOnlyDaysRemaining(verified.expiry_date, selected.business_date)
+    : null
   const auth = { Authorization: `Bearer ${token}` }
 
   async function refresh() {
@@ -171,7 +192,8 @@ export default function PharmacistReview({ token, onReviewComplete }: { token: s
       <div><h3 className="text-lg font-semibold">Medicine donation</h3><p className="mt-1 text-sm text-[#718078]">Pickup address: {selected.pickup_address || 'Not provided'}</p><p className="mt-1 text-sm text-[#718078]">Donor-reported expiry: {selected.donor_expiry_date ? new Date(`${selected.donor_expiry_date}T00:00:00`).toLocaleDateString() : 'Not provided'}</p></div>
       <div className="mt-5"><h4 className="text-sm font-semibold">Original uploaded medicine photos</h4>{selected.images.length ? <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">{selected.images.map((image) => <div key={image.id} className="overflow-hidden rounded-xl border border-[#e4e9e0] bg-[#f7f8f5]"><div className="grid aspect-square place-items-center">{images[`${selected.id}:${image.id}`] ? <a className="size-full" target="_blank" rel="noreferrer" href={images[`${selected.id}:${image.id}`]}><img className="size-full object-contain" src={images[`${selected.id}:${image.id}`]} alt="Uploaded medicine package" /></a> : <FileImage className="text-[#9aab96]" />}</div></div>)}</div> : <p className="mt-2 text-sm text-[#718078]">No photos were submitted.</p>}</div>
       <section className="clinic-ocr-panel" aria-labelledby="clinic-ocr-title"><div className="clinic-ocr-header"><div className="clinic-ocr-intro"><h4 id="clinic-ocr-title">AI/OCR extracted information</h4><p>Compare each result against the uploaded photos and physical package. OCR alone cannot approve a donation.</p></div><button type="button" onClick={() => void runOCR()} disabled={ocrBusy || selected.images.length === 0} className="clinic-ocr-button">{ocrBusy ? 'Running OCR...' : 'Run OCR'}</button></div>{extractions.length ? extractions.map((item, index) => <article key={index} className={`clinic-ocr-result${item.status === 'FAILED' ? ' clinic-ocr-result-error' : ''}`}><p className="clinic-ocr-meta">Photo {index + 1}: {item.is_mock ? 'Mock provider; no OCR was performed.' : item.provider === 'gemini' ? 'Gemini-assisted result; calibrated OCR confidence scores are not available.' : typeof item.overall_confidence === 'number' ? `Overall confidence ${Math.round(item.overall_confidence * 100)}%.` : 'Confidence unavailable.'}</p>{item.raw_ocr_text && <div className="clinic-ocr-recognized"><p>Recognized package text</p><pre>{item.raw_ocr_text}</pre></div>}<dl className="clinic-ocr-fields">{Object.entries(item.fields).map(([field, value]) => <div key={field}><dt>{field.replaceAll('_', ' ')}</dt><dd>{value ?? 'Not detected'}</dd></div>)}</dl>{!item.is_mock && item.provider !== 'gemini' && <p className="clinic-ocr-meta">Field confidence: {Object.entries(item.fields).map(([field]) => `${field.replaceAll('_', ' ')} ${Math.round((item.confidence[field] ?? 0) * 100)}%`).join(' · ')}</p>}{item.status === 'FAILED' && <p role="alert" className="clinic-ocr-error">{item.error_message ?? 'OCR could not read this image. Upload a sharper, well-lit photo showing the medicine name, strength, batch number, and expiry date, or verify the package manually.'}</p>}<p className="clinic-ocr-meta">{item.provider === 'gemini' ? 'Gemini does not provide per-field confidence; verify all values against the package.' : `Uncertain fields: ${Object.entries(item.confidence).filter(([field, score]) => field !== 'overall_confidence' && (score == null || score < 0.5)).map(([field]) => field.replaceAll('_', ' ')).join(', ') || 'none'}.`}</p></article>) : <p className="clinic-ocr-empty">OCR has not been run. You may run OCR or continue with manual package verification.</p>}</section>
-      {verified && <fieldset className="mt-5 rounded-xl border border-[#e4e9e0] p-4"><legend className="px-2 text-sm font-semibold">Pharmacist-verified medicine information</legend><p className="mb-3 text-xs text-[#718078]">Review and correct these fields after checking the package.</p><div className="grid gap-3 sm:grid-cols-2">{([['medicine_name', 'Medicine name', 'text'], ['strength', 'Strength', 'text'], ['dosage_form', 'Dosage form', 'text'], ['packaging_type', 'Packaging type', 'text'], ['manufacturer', 'Manufacturer', 'text'], ['batch_number', 'Batch number', 'text'], ['expiry_date', 'Verified expiry date', 'date'], ['quantity', 'Verified quantity', 'number'], ['unit', 'Quantity unit', 'text']] as const).map(([key, label, type]) => { const required = ['medicine_name', 'expiry_date', 'quantity', 'unit'].includes(key); return <label key={key} className="block text-sm font-medium">{label} {required ? <span className="text-red-700">* Required</span> : <span className="text-[#718078]">(Optional)</span>}<input className={inputClass} type={type} min={type === 'number' ? '1' : undefined} placeholder={key === 'expiry_date' ? 'Select the verified expiry date' : undefined} value={verified[key]} onChange={(event) => { setVerified((current) => current ? { ...current, [key]: event.target.value } : current); setFieldErrors((current) => ({ ...current, [key]: '' })) }} /></label>})}<label className="block text-sm font-medium">Patient-facing common use <span className="text-red-700">* Required</span><select className={inputClass} value={verified.common_use_category} onChange={(event) => setVerified((current) => current ? { ...current, common_use_category: event.target.value as CommonUseCategory } : current)}>{categories.map((category) => <option key={category.value} value={category.value}>{category.label}</option>)}</select></label></div>{Object.entries(fieldErrors).map(([key, message]) => message && <p key={key} role="alert" className="mt-2 text-sm text-red-700">{message}</p>)}<p className="mt-2 text-xs text-[#718078]">Cold, Cough, Flu, and Fever permit a request without a prescription under the current product rule. All other categories require one. This is a common-use classification, not a diagnosis.</p></fieldset>}
+      {verified && <fieldset className="mt-5 rounded-xl border border-[#e4e9e0] p-4"><legend className="px-2 text-sm font-semibold">Pharmacist-verified medicine information</legend><p className="mb-3 text-xs text-[#718078]">Review and correct these fields after checking the package.</p><div className="grid gap-3 sm:grid-cols-2">{([['medicine_name', 'Medicine name', 'text'], ['strength', 'Strength', 'text'], ['dosage_form', 'Dosage form', 'text'], ['packaging_type', 'Packaging type', 'text'], ['manufacturer', 'Manufacturer', 'text'], ['batch_number', 'Batch number', 'text'], ['expiry_date', 'Verified expiry date', 'date'], ['quantity', 'Verified quantity', 'number'], ['unit', 'Quantity unit', 'text']] as const).map(([key, label, type]) => { const required = ['medicine_name', 'expiry_date', 'quantity', 'unit'].includes(key); return <label key={key} className="block text-sm font-medium">{label} {required ? <span className="text-red-700">* Required</span> : <span className="text-[#718078]">(Optional)</span>}<input className={inputClass} type={type} min={type === 'number' ? '1' : undefined} placeholder={key === 'expiry_date' ? 'Select the verified expiry date' : undefined} value={verified[key]} onChange={(event) => { setVerified((current) => current ? { ...current, [key]: event.target.value } : current); setFieldErrors((current) => ({ ...current, [key]: '' })) }} /></label>})}<label className="block text-sm font-medium">Patient-facing common use <span className="text-red-700">* Required</span><select className={inputClass} value={verified.common_use_category} onChange={(event) => setVerified((current) => current ? { ...current, common_use_category: event.target.value as CommonUseCategory } : current)}>{categories.map((category) => <option key={category.value} value={category.value}>{category.label}</option>)}</select></label></div>{Object.entries(fieldErrors).map(([key, message]) => message && <p key={key} role="alert" className="mt-2 text-sm text-red-700">{message}</p>)}<p className="mt-2 text-xs text-[#718078]">Expiry OCR accepts MM/YYYY, MM/YY (YY means 20YY), DD/MM/YYYY, DD-MM-YYYY, and YYYY-MM-DD. Month/year labels normalize to the last day of that month; verify every date against the package. At least the configured minimum shelf life is required for approval. Cold, Cough, Flu, and Fever permit a request without a prescription under the current product rule. All other categories require one. This is a common-use classification, not a diagnosis.</p></fieldset>}
+      {selected && verifiedExpiryDays !== null && (verifiedExpiryDays < selected.minimum_remaining_shelf_life_days || verifiedExpiryDays <= selected.expiry_warning_days) && <p role="status" className={`mt-4 rounded-xl p-3 text-sm ${verifiedExpiryDays < selected.minimum_remaining_shelf_life_days ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-800'}`}>{verifiedExpiryDays < 0 ? 'This medicine is expired and cannot be approved.' : verifiedExpiryDays < selected.minimum_remaining_shelf_life_days ? `Only ${verifiedExpiryDays} days remain; at least ${selected.minimum_remaining_shelf_life_days} days are required for approval.` : `Near-expiry warning: ${verifiedExpiryDays} days remain. It meets the minimum shelf-life rule but will need timely redistribution.`}</p>}
       <label className="mt-5 flex items-start gap-2 rounded-xl border border-[#dce9d6] bg-[#f5f9f2] p-4 text-sm leading-6 text-[#55704f]"><input className="mt-1" type="checkbox" checked={physicalChecked} onChange={(event) => setPhysicalChecked(event.target.checked)} /><span>I physically cross-checked the medicine and package against the photos and verified information. <b className="text-red-700">Required for approval.</b> For rejection, incomplete verified details are not submitted. I understand the pharmacist is the final authority.</span></label>
       <label className="mt-4 block text-sm font-medium">Rejection reason <span className="text-red-700">* Required to reject</span> <span className="text-[#718078]">(Optional for approval)</span><textarea className={`${inputClass} min-h-24 resize-y`} value={reason} onChange={(event) => { setReason(event.target.value); setReasonError('') }} maxLength={2000} placeholder="Enter a clear reason if rejecting this donation" />{reasonError && <span role="alert" className="mt-1 block text-sm text-red-700">{reasonError}</span>}</label>
       {selected && error && <p role="alert" className="mt-3 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}

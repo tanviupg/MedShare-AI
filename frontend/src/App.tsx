@@ -362,7 +362,6 @@ function DonorDashboard({ donations, donationsLoading, userName, token, view, se
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const galleryInputRef = useRef<HTMLInputElement>(null)
-  const today = new Date().toISOString().slice(0, 10)
   const tabs = [
     { id: 'Overview' as const, icon: <LayoutDashboard size={16} /> },
     { id: 'Donate Medicine' as const, icon: <Upload size={16} /> },
@@ -518,7 +517,7 @@ function DonorDashboard({ donations, donationsLoading, userName, token, view, se
           <form onSubmit={(event) => void submitForm(event)} className="donor-details-form"><div className="donor-section-heading"><span className="donor-step donor-step-sage">02</span><div><h2>Pickup details</h2><p>You do not need to identify the medicine.</p></div></div>
             <div className="donor-workflow-note"><ShieldCheck size={16} /><p>The pharmacist records medicine name, batch, packaging, and quantity after physically verifying it. Donor entries for those details are not part of this workflow.</p></div>
             <label className="donor-field">Pickup address <span className="donor-required">Required</span><span className="donor-input-wrap"><MapPin size={16} /><input name="pickup_address" autoComplete="street-address" required maxLength={500} placeholder="Where can the clinic collect it?" /></span></label>
-            <label className="donor-field">Expiry date <span className="donor-optional">If known</span><input className="donor-date" type="date" name="donor_expiry_date" min={today} /></label>
+            <label className="donor-field">Expiry date <span className="donor-optional">If known</span><input className="donor-date" type="date" name="donor_expiry_date" /></label>
             {error && <p role="alert" className="donor-inline-alert donor-inline-error">{error}</p>}
             <button disabled={busy} className="donor-button donor-button-primary donor-submit">{busy ? <><span className="donor-spinner" aria-hidden="true" />Submitting donation…</> : <>Submit donation <Heart size={16} /></>}</button><p className="donor-privacy">Our clinic pharmacist will identify and verify the medicine from your photos.</p>
           </form></div>

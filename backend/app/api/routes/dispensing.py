@@ -11,7 +11,7 @@ from app.models import Checkout, ClinicProfile, DispensingRecord, Inventory, Inv
 from app.schemas.dispensing import PatientDispensingResponse, PharmacistDispensingResponse
 from app.models import NotificationType
 from app.services.notifications import notify
-from app.services.business_time import business_today
+from app.services.expiry import expiry_is_eligible, synchronize_expired_reservations
 
 pharmacist_router = APIRouter(prefix="/pharmacist", tags=["pharmacist dispensing"])
 patient_router = APIRouter(prefix="/patient", tags=["patient dispensing"])
@@ -54,6 +54,7 @@ def _owned_request(db: Session, request_id: UUID, pharmacist: User, lock: bool =
 
 @pharmacist_router.get("/dispensing", response_model=list[PharmacistDispensingResponse])
 def list_ready_for_pickup(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id)
     rows = db.scalars(select(MedicineRequest).join(Inventory, Inventory.id == MedicineRequest.inventory_id).where(
         Inventory.pharmacist_id == pharmacist.id, MedicineRequest.status == MedicineRequestStatus.APPROVED
     ).order_by(MedicineRequest.created_at)).all()
@@ -62,6 +63,7 @@ def list_ready_for_pickup(db: Session = Depends(get_db), pharmacist: User = Depe
 
 @pharmacist_router.get("/requests/{request_id}/dispensing", response_model=PharmacistDispensingResponse)
 def get_pharmacist_dispensing(request_id: UUID, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id, request_id=request_id)
     row = _owned_request(db, request_id, pharmacist)
     if row.status not in (MedicineRequestStatus.APPROVED, MedicineRequestStatus.FULFILLED):
         raise HTTPException(status_code=404, detail="Dispensing information not found")
@@ -71,6 +73,7 @@ def get_pharmacist_dispensing(request_id: UUID, db: Session = Depends(get_db), p
 
 @pharmacist_router.post("/requests/{request_id}/dispense", response_model=PharmacistDispensingResponse)
 def dispense_request(request_id: UUID, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id, request_id=request_id)
     row = _owned_request(db, request_id, pharmacist, lock=True)
     inventory = db.scalar(select(Inventory).where(Inventory.id == row.inventory_id).with_for_update())
     if inventory is None or inventory.pharmacist_id != pharmacist.id:
@@ -83,8 +86,8 @@ def dispense_request(request_id: UUID, db: Session = Depends(get_db), pharmacist
     # payable. A positive checkout remains gated on successful payment.
     if payment is not None and payment.amount > 0 and payment.payment_status != PaymentStatus.PAID:
         raise HTTPException(status_code=409, detail="Payment must be completed before dispensing")
-    if inventory.status == InventoryStatus.EXPIRED or inventory.expiry_date < business_today():
-        raise HTTPException(status_code=409, detail="Expired inventory cannot be dispensed")
+    if inventory.status == InventoryStatus.EXPIRED or not expiry_is_eligible(inventory.expiry_date):
+        raise HTTPException(status_code=409, detail="Medicine no longer meets the minimum remaining shelf-life requirement")
     if row.requested_quantity <= 0 or row.pickup_code is None:
         raise HTTPException(status_code=409, detail="This request has no valid reserved quantity")
     if db.scalar(select(DispensingRecord.id).where(DispensingRecord.request_id == row.id)) is not None:
@@ -111,6 +114,7 @@ def dispense_request(request_id: UUID, db: Session = Depends(get_db), pharmacist
 
 @patient_router.get("/dispensing", response_model=list[PatientDispensingResponse])
 def list_patient_dispensing(db: Session = Depends(get_db), patient: User = Depends(require_role(UserRole.PATIENT))):
+    synchronize_expired_reservations(db, patient_id=patient.id)
     rows = db.scalars(select(MedicineRequest).where(
         MedicineRequest.patient_id == patient.id,
         MedicineRequest.status.in_([MedicineRequestStatus.APPROVED, MedicineRequestStatus.FULFILLED]),
@@ -120,6 +124,7 @@ def list_patient_dispensing(db: Session = Depends(get_db), patient: User = Depen
 
 @patient_router.get("/requests/{request_id}/dispensing", response_model=PatientDispensingResponse)
 def get_patient_dispensing(request_id: UUID, db: Session = Depends(get_db), patient: User = Depends(require_role(UserRole.PATIENT))):
+    synchronize_expired_reservations(db, patient_id=patient.id, request_id=request_id)
     row = db.scalar(select(MedicineRequest).where(MedicineRequest.id == request_id, MedicineRequest.patient_id == patient.id))
     if row is None:
         raise HTTPException(status_code=404, detail="Medicine request not found")
@@ -127,5 +132,3 @@ def get_patient_dispensing(request_id: UUID, db: Session = Depends(get_db), pati
         raise HTTPException(status_code=404, detail="Dispensing information not found")
     record = db.scalar(select(DispensingRecord).where(DispensingRecord.request_id == row.id))
     return _payload(db, row, record)
-
-

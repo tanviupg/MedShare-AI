@@ -19,7 +19,7 @@ from app.models import (
     WasteStatus,
 )
 from app.schemas.admin_dashboard import AdminPlatformDashboard
-from app.services.business_time import business_today
+from app.services.expiry import minimum_eligible_expiry_date
 
 router = APIRouter(prefix="/admin", tags=["admin dashboard"])
 
@@ -53,7 +53,7 @@ def admin_platform_dashboard(
     available_quantity = int(db.scalar(select(func.coalesce(func.sum(Inventory.quantity_available), 0)).where(
         Inventory.status == InventoryStatus.AVAILABLE,
         Inventory.quantity_available > 0,
-        Inventory.expiry_date >= business_today(),
+        Inventory.expiry_date >= minimum_eligible_expiry_date(),
     )) or 0)
     # Reserved units have already been removed from quantity_available. Sum their
     # active request reservations separately so the dashboard never counts them twice.

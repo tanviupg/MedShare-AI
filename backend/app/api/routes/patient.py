@@ -1,3 +1,4 @@
+from datetime import date
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,11 +12,14 @@ from app.models import ClinicProfile, ClinicVerificationStatus, CommonUseCategor
 from app.schemas.patient import PatientMedicineImage, PatientMedicineOption, PatientMedicinePage
 from app.api.routes.donations import storage
 from app.services.business_time import business_today
+from app.core.config import get_settings
+from app.services.expiry import expiry_warning_days, minimum_eligible_expiry_date
 
 router = APIRouter(prefix="/patient", tags=["patient discovery"])
 
 
-def available_inventory_query():
+def available_inventory_query(today: date | None = None):
+    today = today or business_today()
     return (
         select(Inventory, ClinicProfile)
         .join(Donation, Donation.id == Inventory.donation_id)
@@ -25,7 +29,7 @@ def available_inventory_query():
             Inventory.status == InventoryStatus.AVAILABLE,
             Donation.status == DonationStatus.APPROVED,
             Inventory.quantity_available > 0,
-            Inventory.expiry_date >= business_today(),
+            Inventory.expiry_date >= minimum_eligible_expiry_date(today),
             User.is_active.is_(True),
             ClinicProfile.verification_status == ClinicVerificationStatus.VERIFIED,
         )
@@ -45,7 +49,8 @@ def search_medicines(
     db: Session = Depends(get_db),
     _user: User = Depends(require_role(UserRole.PATIENT)),
 ) -> PatientMedicinePage:
-    query = available_inventory_query()
+    today = business_today()
+    query = available_inventory_query(today)
     if q and q.strip():
         query = query.where(Inventory.medicine_name.ilike(f"%{q.strip()}%"))
     if strength and strength.strip():
@@ -76,6 +81,9 @@ def search_medicines(
             medicine_name=item.medicine_name,
             common_use_category=item.common_use_category,
             expiry_date=item.expiry_date,
+            days_remaining=(item.expiry_date - today).days,
+            expiry_warning_days=expiry_warning_days(),
+            minimum_remaining_shelf_life_days=get_settings().minimum_remaining_shelf_life_days,
             availability=item.quantity_available,
             availability_unit=item.unit,
             clinic_name=profile.clinic_name,

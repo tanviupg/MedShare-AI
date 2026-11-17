@@ -15,6 +15,7 @@ from app.schemas.waste import ExpiryInventoryResponse, RejectedDonationVerificat
 from app.models import NotificationType
 from app.services.notifications import notify
 from app.services.business_time import business_today
+from app.services.expiry import synchronize_expired_reservations
 
 router = APIRouter(prefix="/pharmacist", tags=["pharmacist expiry and waste"])
 
@@ -31,6 +32,7 @@ def expire_inventory_records(db: Session, pharmacist_id: UUID, today: date | Non
         item.status = InventoryStatus.EXPIRED
     changed = len(changed_rows)
     db.commit()
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist_id, today=today)
     return changed
 
 
@@ -73,6 +75,7 @@ def _inventory_lists(db: Session, pharmacist: User, expiring: bool):
 @router.get("/inventory/expiring", response_model=list[ExpiryInventoryResponse])
 def expiring_inventory(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
     _require_verified_clinic(db, pharmacist)
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id)
     return _inventory_lists(db, pharmacist, True)
 
 
@@ -86,10 +89,17 @@ def expired_inventory(db: Session = Depends(get_db), pharmacist: User = Depends(
 @router.post("/inventory/{inventory_id}/waste", response_model=WasteResponse, status_code=201)
 def move_inventory_to_waste(inventory_id: UUID, body: WasteCreate, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
     _require_verified_clinic(db, pharmacist)
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id)
     try:
         item = db.scalar(select(Inventory).where(Inventory.id == inventory_id).with_for_update())
         if item is None or item.pharmacist_id != pharmacist.id:
             raise HTTPException(status_code=404, detail="Inventory record not found")
+        pending_record = db.scalar(select(WasteRecord.id).where(
+            WasteRecord.inventory_id == item.id,
+            WasteRecord.status != WasteStatus.DISPOSED,
+        ))
+        if pending_record is not None:
+            raise HTTPException(status_code=409, detail="An active waste record already exists for this inventory")
         today = business_today()
         if item.expiry_date < today and item.status in (InventoryStatus.AVAILABLE, InventoryStatus.RESERVED):
             item.status = InventoryStatus.EXPIRED
@@ -125,6 +135,7 @@ def rejected_for_disposal(db: Session = Depends(get_db), pharmacist: User = Depe
     return [{"id": donation.id, "medicine_name": donation.medicine_name, "strength": donation.strength,
              "quantity": donation.quantity, "quantity_verified": review.verified_details is not None,
              "unit": donation.unit, "expiry_date": donation.expiry_date,
+             "days_remaining": (donation.expiry_date - business_today()).days if donation.expiry_date else None,
              "created_at": donation.created_at} for donation, review in rows]
 
 

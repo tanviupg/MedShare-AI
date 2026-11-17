@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +14,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = 60
     upload_dir: Path = Path("uploads")
-    expiry_warning_days: int = 90
+    expiry_warning_days: int = Field(default=90, ge=0)
+    minimum_remaining_shelf_life_days: int = Field(default=30, ge=0)
     medicine_extraction_provider: str = "gemini"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"

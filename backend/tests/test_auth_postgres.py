@@ -1503,19 +1503,26 @@ class TestAuthPostgres(unittest.TestCase):
         expiring_status, expiring_body = request("GET", "/pharmacist/inventory/expiring", token=pharmacist_token)
         self.assertEqual(expiring_status, 200, expiring_body)
         self.assertTrue(any(row["medicine_name"] == "Paracetamol" and row["days_remaining"] == 45 for row in json.loads(expiring_body)))
-        today_donation = json.loads(self.create_donation(donor_token, medicine_name="Expires Today", expiry_date=business_today().isoformat())[1])
+        today_donation = json.loads(self.create_donation(
+            donor_token,
+            medicine_name="Expires In 30 Days",
+            expiry_date=(business_today() + timedelta(days=30)).isoformat(),
+        )[1])
         self.assertEqual(self.approve_donation(today_donation["id"], pharmacist_token)[0], 201)
         expiring_status, expiring_body = request("GET", "/pharmacist/inventory/expiring", token=pharmacist_token)
         self.assertEqual(expiring_status, 200, expiring_body)
-        self.assertTrue(any(row["medicine_name"] == "Expires Today" and row["days_remaining"] == 0 for row in json.loads(expiring_body)))
-        patient_medicines = request("GET", "/patient/medicines?q=Expires%20Today", token=patient_token)
+        self.assertTrue(any(row["medicine_name"] == "Expires In 30 Days" and row["days_remaining"] == 30 for row in json.loads(expiring_body)))
+        patient_medicines = request("GET", "/patient/medicines?q=Expires%20In%2030%20Days", token=patient_token)
         self.assertEqual(patient_medicines[0], 200, patient_medicines[1])
         self.assertEqual(json.loads(patient_medicines[1])["total"], 1)
-        # Discovery evaluates the Kolkata business date on each request, so
-        # the same inventory drops out as soon as that date advances.
+        # Discovery evaluates the minimum remaining shelf life on the Kolkata
+        # business date, so the inventory drops out below the 30-day threshold.
         tomorrow = business_today() + timedelta(days=1)
-        with patch("app.api.routes.patient.business_today", return_value=tomorrow):
-            next_day = request("GET", "/patient/medicines?q=Expires%20Today", token=patient_token)
+        with (
+            patch("app.api.routes.patient.business_today", return_value=tomorrow),
+            patch("app.api.routes.patient.minimum_eligible_expiry_date", return_value=tomorrow + timedelta(days=30)),
+        ):
+            next_day = request("GET", "/patient/medicines?q=Expires%20In%2030%20Days", token=patient_token)
         self.assertEqual(next_day[0], 200, next_day[1])
         self.assertEqual(json.loads(next_day[1])["total"], 0)
         donation = json.loads(self.create_donation(donor_token, medicine_name="Expired Waste Test")[1])

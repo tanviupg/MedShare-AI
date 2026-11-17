@@ -12,7 +12,9 @@ from app.services.medicine_extraction import (
     PaddleOCRExtractionProvider,
     UnreadableImageError,
     _map_visible_fields,
+    _parse_gemini_fields,
     get_extraction_provider,
+    normalize_expiry_date,
 )
 
 
@@ -74,7 +76,8 @@ class MedicineExtractionProviderTests(unittest.TestCase):
             b"synthetic image bytes", "image/png"
         )
 
-        self.assertEqual({field: result.fields[field] for field in FIELDS}, response_fields)
+        expected_fields = {**response_fields, "expiry_date": "2030-12-31"}
+        self.assertEqual({field: result.fields[field] for field in FIELDS}, expected_fields)
         self.assertIsNone(result.fields["raw_ocr_text"])
         self.assertEqual(result.confidence, {field: None for field in FIELDS})
         self.assertIsNone(result.overall_confidence)
@@ -164,7 +167,7 @@ class MedicineExtractionProviderTests(unittest.TestCase):
         self.assertEqual(fields["strength"], "500 MG")
         self.assertEqual(fields["dosage_form"], "TABLETS")
         self.assertEqual(fields["batch_number"], "AB1234")
-        self.assertEqual(fields["expiry_date"], "12/2030")
+        self.assertEqual(fields["expiry_date"], "2030-12-31")
         self.assertEqual(fields["quantity"], 10)
         self.assertIsNone(fields["manufacturer"])
         self.assertIsNone(fields["packaging_type"])
@@ -188,7 +191,7 @@ class MedicineExtractionProviderTests(unittest.TestCase):
         self.assertEqual(fields["strength"], "40 mg")
         self.assertEqual(fields["dosage_form"], "TABLETS")
         self.assertEqual(fields["batch_number"], "AB1234")
-        self.assertEqual(fields["expiry_date"], "12/2030")
+        self.assertEqual(fields["expiry_date"], "2030-12-31")
         self.assertEqual(fields["quantity"], 10)
         self.assertIsNone(fields["manufacturer"])
         self.assertIsNone(fields["packaging_type"])
@@ -209,11 +212,44 @@ class MedicineExtractionProviderTests(unittest.TestCase):
         self.assertTrue(all(fields[field] is None for field in FIELDS))
         self.assertTrue(all(confidence[field] == 0.0 for field in FIELDS))
 
-    def test_expiry_formats_are_preserved_without_fabricating_a_day(self):
-        for visible in ("08/27", "08-2027", "2027-08"):
+    def test_expiry_formats_are_normalized_to_date_only_iso_values(self):
+        for visible, expected in (("08/27", "2027-08-31"), ("08-2027", "2027-08-31")):
             with self.subTest(visible=visible):
                 fields, _ = _map_visible_fields([(f"EXP {visible}", 0.95)])
-                self.assertEqual(fields["expiry_date"], visible)
+                self.assertEqual(fields["expiry_date"], expected)
+
+    def test_full_expiry_formats_are_parsed_without_partial_month_year_matches(self):
+        cases = {
+            "08/2030": "2030-08-31",
+            "08/30": "2030-08-31",
+            "2030-08": "2030-08-31",
+            "2030/08": "2030-08-31",
+            "31/08/2030": "2030-08-31",
+            "31-08-2030": "2030-08-31",
+            "2030-08-31": "2030-08-31",
+            "03/04/2030": "2030-04-03",
+        }
+        for visible, expected in cases.items():
+            with self.subTest(visible=visible):
+                self.assertEqual(normalize_expiry_date(visible), expected)
+
+        for invalid in ("13/2030", "02/29/2027", "2027-02-29", "04/05/28", "04/05/2030/1", ""):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(normalize_expiry_date(invalid))
+
+        for visible, expected in (
+            ("EXP 2030-08", "2030-08-31"),
+            ("EXP 31/08/2030", "2030-08-31"),
+            ("EXP 31-08-2030", "2030-08-31"),
+            ("EXP 2030-08-31", "2030-08-31"),
+        ):
+            fields, _ = _map_visible_fields([(visible, 0.95)])
+            self.assertEqual(fields["expiry_date"], expected)
+
+        fields, _ = _map_visible_fields([("EXP 04/05/28", 0.95)])
+        self.assertIsNone(fields["expiry_date"])
+        fields = _parse_gemini_fields(json.dumps({"expiry_date": "not a date"}))
+        self.assertIsNone(fields["expiry_date"])
 
     @unittest.skipUnless(os.environ.get("RUN_LOCAL_PADDLEOCR") == "1", "set RUN_LOCAL_PADDLEOCR=1 to run the real local model")
     def test_real_paddleocr_on_synthetic_package_image(self):
@@ -245,7 +281,7 @@ class MedicineExtractionProviderTests(unittest.TestCase):
         self.assertEqual(result.fields["strength"], "500 MG")
         self.assertEqual(result.fields["dosage_form"], "TABLETS")
         self.assertEqual(result.fields["batch_number"], "AB1234")
-        self.assertEqual(result.fields["expiry_date"], "12/2030")
+        self.assertEqual(result.fields["expiry_date"], "2030-12-31")
         self.assertEqual(result.fields["quantity"], 10)
         self.assertGreater(result.overall_confidence, 0)
 

@@ -36,6 +36,9 @@ class InventoryResponse(BaseModel):
     public_id: UUID
     batch_number: str | None
     expiry_date: date
+    days_remaining: int
+    expiry_warning_days: int
+    minimum_remaining_shelf_life_days: int
     quantity_available: int
     reserved_quantity: int = 0
     original_quantity: int

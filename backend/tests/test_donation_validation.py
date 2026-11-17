@@ -2,6 +2,7 @@ import unittest
 from datetime import date, timedelta
 from io import BytesIO
 from PIL import Image
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -38,6 +39,8 @@ class DonationImageValidationTests(unittest.TestCase):
 
 
 class DonationApprovalValidationTests(unittest.TestCase):
+    today = date(2030, 1, 1)
+
     def payload(self, expiry_date):
         return {
             "decision": "APPROVED",
@@ -52,23 +55,30 @@ class DonationApprovalValidationTests(unittest.TestCase):
             },
         }
 
-    def test_expired_medicine_cannot_be_approved(self):
+    @patch("app.schemas.donation.business_today", return_value=date(2030, 1, 1))
+    def test_expired_medicine_cannot_be_approved(self, _business_today):
         with self.assertRaises(ValidationError) as raised:
-            DonationReviewCreate.model_validate(self.payload(date.today() - timedelta(days=1)))
-        self.assertIn("Expired medicine cannot be approved", str(raised.exception))
+            DonationReviewCreate.model_validate(self.payload(self.today - timedelta(days=1)))
+        self.assertIn("remaining shelf life", str(raised.exception))
 
-    def test_unexpired_medicine_remains_approvable(self):
-        review = DonationReviewCreate.model_validate(self.payload(date.today() + timedelta(days=1)))
+    @patch("app.schemas.donation.business_today", return_value=date(2030, 1, 1))
+    def test_medicine_meeting_minimum_shelf_life_is_approvable(self, _business_today):
+        review = DonationReviewCreate.model_validate(self.payload(self.today + timedelta(days=30)))
         self.assertEqual(review.decision.value, "APPROVED")
 
+    @patch("app.schemas.donation.business_today", return_value=date(2030, 1, 1))
+    def test_medicine_below_minimum_shelf_life_cannot_be_approved(self, _business_today):
+        with self.assertRaisesRegex(ValidationError, "at least 30 days"):
+            DonationReviewCreate.model_validate(self.payload(self.today + timedelta(days=29)))
+
     def test_medicine_without_traceable_batch_cannot_be_approved(self):
-        payload = self.payload(date.today() + timedelta(days=1))
+        payload = self.payload(self.today + timedelta(days=30))
         payload["verified_details"]["batch_number"] = None
         with self.assertRaisesRegex(ValidationError, "traceable batch number"):
             DonationReviewCreate.model_validate(payload)
 
     def test_appearance_only_or_insufficient_evidence_does_not_bypass_manual_review(self):
-        payload = self.payload(date.today() + timedelta(days=1))
+        payload = self.payload(self.today + timedelta(days=30))
         payload["physical_package_checked"] = False
         with self.assertRaisesRegex(ValidationError, "Physically check the package"):
             DonationReviewCreate.model_validate(payload)

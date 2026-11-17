@@ -16,6 +16,9 @@ class PatientMedicineOption(BaseModel):
     medicine_name: str
     common_use_category: CommonUseCategory
     expiry_date: date
+    days_remaining: int
+    expiry_warning_days: int
+    minimum_remaining_shelf_life_days: int
     availability: int
     availability_unit: str
     clinic_name: str

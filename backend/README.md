@@ -43,6 +43,14 @@ The health endpoint is `GET http://localhost:8000/health`. Authentication endpoi
 
 Donors can submit medicine details with `POST /donations`, list their submissions with `GET /donations/mine`, and retrieve one owned submission with `GET /donations/{donation_id}`. Attach up to eight JPEG, PNG, or WebP images (5 MB each) using multipart `POST /donations/{donation_id}/images` with repeated `files` fields. Image metadata is returned with an authenticated download URL; local image bytes are stored under `UPLOAD_DIR` (defaults to `uploads/`). Every new submission starts at `PENDING_REVIEW`. Review state changes are not exposed yet.
 
+## Medicine expiry policy
+
+Expiry is stored and compared as a date-only value using the `Asia/Kolkata` business date. Pharmacists must confirm the expiry printed on the physical package before approval. A medicine is eligible for approval, patient search/request, checkout, and dispensing only when its expiry date is at least `MINIMUM_REMAINING_SHELF_LIFE_DAYS` calendar days after the current business date; the default is 30 days. Set this environment variable to a non-negative integer to configure the minimum. The existing 90-day expiry warning is separate and configurable through `EXPIRY_WARNING_DAYS`.
+
+OCR normalizes `MM/YYYY` and `MM/YY` to the final day of that month (`YY` maps to `20YY`). For compatibility, year-first month labels `YYYY-MM` and `YYYY/MM` are also accepted. Full dates in `DD/MM/YYYY`, `DD-MM-YYYY`, or ISO `YYYY-MM-DD` form are normalized to ISO `YYYY-MM-DD`. Numeric slash/dash full dates use day-first interpretation. Unsupported or invalid values remain missing and require pharmacist correction; OCR does not determine approval eligibility.
+
+Active reservations that no longer meet the minimum shelf-life policy are rejected and released when the relevant request, checkout, dispensing, inventory, or waste workflow is accessed. Expired quantities remain excluded from patient availability and can be recorded through the existing waste workflow. Paid simulated checkouts are not automatically refunded by expiry cleanup and require operational follow-up.
+
 ## Migrations
 
 Alembic is configured to use `DATABASE_URL` from `.env` and `Base.metadata` from `app.db.base`. Database migration commands require a reachable PostgreSQL database:

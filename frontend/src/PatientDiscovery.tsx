@@ -12,6 +12,9 @@ type Medicine = {
   medicine_name: string
   common_use_category: string
   expiry_date: string
+  days_remaining: number
+  expiry_warning_days: number
+  minimum_remaining_shelf_life_days: number
   availability: number
   availability_unit: string
   clinic_name: string
@@ -466,6 +469,7 @@ export default function PatientDiscovery({ token, userName, onLogout }: { token:
             const imageKey = image ? `${item.medicine_id}:${image.image_url}` : ''
             const imageUrl = imageUrls[imageKey]
             const prescription = item.prescription_required === true
+            const expiringSoon = item.days_remaining <= item.expiry_warning_days
             return <article key={item.medicine_id} className="patient-medicine-card" style={{ animationDelay: `${index * 45}ms` }}>
               <div className="patient-card-head"><div className="patient-medicine-drawing">
                 {imageUrl ? <button type="button" className="patient-image-open" aria-label={`Enlarge ${item.medicine_name} package image`} onClick={() => setLightbox({ medicineName: item.medicine_name, url: imageUrl })}><img src={imageUrl} alt={`${item.medicine_name} package`} onError={() => {
@@ -476,7 +480,7 @@ export default function PatientDiscovery({ token, userName, onLogout }: { token:
               <p className="patient-category">{categoryLabel(item.common_use_category)}</p>
               <h2>{item.medicine_name}</h2>
               <p className="patient-clinic"><MapPin size={14} />{item.clinic_name} · {item.clinic_city}</p>
-              <div className="patient-medicine-bottom"><span>{item.availability} {item.availability_unit}<small>Expires {new Date(`${item.expiry_date}T00:00:00`).toLocaleDateString()}</small>{prescription && <small className="patient-rx-note">Prescription required</small>}</span><button type="button" onClick={() => setSelectedMedicine(item)} className="patient-button patient-button-primary">Request<ArrowUpRight size={14} /></button></div>
+              <div className="patient-medicine-bottom"><span>{item.availability} {item.availability_unit}<small>Expires {new Date(`${item.expiry_date}T00:00:00`).toLocaleDateString()}</small>{expiringSoon && <small className="patient-rx-note">Near expiry — collect within {item.days_remaining} days</small>}{prescription && <small className="patient-rx-note">Prescription required</small>}</span><button type="button" onClick={() => setSelectedMedicine(item)} className="patient-button patient-button-primary">Request<ArrowUpRight size={14} /></button></div>
             </article>
           })}
         </div> : <div className="rounded-2xl border border-dashed border-[#dce4d9] px-5 py-10 text-center">
@@ -509,6 +513,7 @@ export default function PatientDiscovery({ token, userName, onLogout }: { token:
           const imageKey = image ? `${selectedMedicine.medicine_id}:${image.image_url}` : ''
           const imageUrl = imageUrls[imageKey]
           const prescription = selectedMedicine.prescription_required === true
+          const expiringSoon = selectedMedicine.days_remaining <= selectedMedicine.expiry_warning_days
           const quantity = requestQuantity[selectedMedicine.medicine_id] ?? 1
           return <>
             <div className="mt-5 flex h-48 w-full shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-[#f3f6f1] sm:h-64">
@@ -522,6 +527,7 @@ export default function PatientDiscovery({ token, userName, onLogout }: { token:
                 <p className="min-w-0 break-words"><span className="text-sm text-[#718078]">Cost</span><br /><span className="font-medium text-[#416b43]">Free - donated medicine</span></p>
                 <p className="min-w-0 break-words min-[420px]:col-span-2"><span className="text-sm text-[#718078]">Clinic</span><br /><span className="font-medium">{selectedMedicine.clinic_name} · {selectedMedicine.clinic_city}</span></p>
               </div>
+              {expiringSoon && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-900">Near expiry: this medicine should be collected within {selectedMedicine.days_remaining} days.</p>}
               <div className={`mt-4 rounded-xl p-3 text-sm ${prescription ? 'bg-amber-50 text-amber-900' : 'bg-[#edf5e9] text-[#416b43]'}`}>
                 {prescription ? <><p className="font-semibold">Approved doctor prescription required</p><p className="mt-1 break-words">This category requires a prescription verified by the clinic before the request can be approved. Common-use categories are not diagnoses.</p></> : <><p className="font-semibold">Prescription not required for a direct request</p><p className="mt-1 break-words">This common-use category is not a diagnosis or treatment recommendation.</p></>}
               </div>
