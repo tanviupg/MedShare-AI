@@ -1,10 +1,12 @@
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
+from app.core.config import get_settings
 from app.models import CommonUseCategory, DonationReviewDecision, DonationStatus
 from app.services.business_time import business_today
+from app.services.expiry import minimum_eligible_expiry_date
 
 
 class DonationCreate(BaseModel):
@@ -62,6 +64,21 @@ class DonationResponse(BaseModel):
     updated_at: datetime
     images: list[DonationImageResponse] = []
 
+    @computed_field
+    @property
+    def business_date(self) -> date:
+        return business_today()
+
+    @computed_field
+    @property
+    def expiry_warning_days(self) -> int:
+        return get_settings().expiry_warning_days
+
+    @computed_field
+    @property
+    def minimum_remaining_shelf_life_days(self) -> int:
+        return get_settings().minimum_remaining_shelf_life_days
+
 
 class DonorDonationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -118,9 +135,15 @@ class DonationReviewCreate(BaseModel):
                 raise ValueError("A traceable batch number is required before approval")
             if self.verified_details.expiry_date is None:
                 raise ValueError("A verified expiry date is required before approval")
-        if (self.decision == DonationReviewDecision.APPROVED and self.verified_details is not None
-                and self.verified_details.expiry_date < business_today()):
-            raise ValueError("Expired medicine cannot be approved")
+        if self.decision == DonationReviewDecision.APPROVED and self.verified_details is not None:
+            today = business_today()
+            minimum_date = minimum_eligible_expiry_date(today)
+        else:
+            return self
+        if self.verified_details.expiry_date < minimum_date:
+            raise ValueError(
+                f"Medicine must have at least {(minimum_date - today).days} days of remaining shelf life to be approved"
+            )
         return self
 
 

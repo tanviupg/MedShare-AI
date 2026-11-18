@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { AlertTriangle, ArrowRight, Bell, ClipboardCheck, Package, Pill, ShieldAlert, Trash2 } from 'lucide-react'
+import { AlertTriangle, ArrowRight, ClipboardCheck, Package, Pill, ShieldAlert, Trash2 } from 'lucide-react'
 import { API_BASE_URL } from './config'
 
 type DashboardData = {
@@ -17,7 +17,7 @@ const dateLabel = (value: string) => new Date(value).toLocaleDateString(undefine
 const button = 'inline-flex items-center gap-1.5 rounded-full border border-[#dce4d9] px-3 py-1.5 text-xs font-semibold text-[#174e3f] hover:bg-[#f5f8f3]'
 const card = 'rounded-2xl border border-[#e4e9e0] bg-white p-4 sm:p-5'
 
-type DashboardTab = 'Donations' | 'Patient Requests' | 'Prescriptions' | 'Inventory' | 'Waste Management' | 'Notifications'
+type DashboardTab = 'Donations' | 'Patient Requests' | 'Prescriptions' | 'Inventory' | 'Waste Management'
 
 export default function PharmacistDashboard({ token, refreshKey, onNavigate }: { token: string; refreshKey: number; onNavigate: (tab: DashboardTab) => void }) {
   const [data, setData] = useState<DashboardData | null>(null)
@@ -65,7 +65,7 @@ export default function PharmacistDashboard({ token, refreshKey, onNavigate }: {
   const stat = (title: string, value: number) => <div key={title} className="rounded-xl bg-[#f7f8f5] p-3"><dt className="text-xs text-[#718078]">{title}</dt><dd className="mt-1 text-lg font-semibold tabular-nums">{value}</dd></div>
 
   return <div className="mt-6 space-y-6 text-left">
-    <header className="flex flex-wrap items-end justify-between gap-3 border-b border-[#edf0ea] pb-4"><div><p className="text-xs font-semibold uppercase tracking-[.12em] text-[#71886d]">Clinic operations</p><h2 className="mt-1 text-2xl font-semibold tracking-tight">Operations Dashboard</h2><p className="mt-1 text-sm text-[#718078]">Your clinic's current queues and stock status.</p></div><a className={button} href="#notifications"><Bell size={14} /> {s.unread_notifications} unread notifications</a></header>
+    <header className="flex flex-wrap items-end justify-between gap-3 border-b border-[#edf0ea] pb-4"><div><p className="text-xs font-semibold uppercase tracking-[.12em] text-[#71886d]">Clinic operations</p><h2 className="mt-1 text-2xl font-semibold tracking-tight">Operations Dashboard</h2><p className="mt-1 text-sm text-[#718078]">Your clinic's current queues and stock status.</p></div></header>
 
     <section aria-label="Operations summary" className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
       {cards.map(([label, value, target, action]) => <article key={label} className={card}><p className="text-xs font-medium text-[#718078]">{label}</p><p className={`mt-2 text-3xl font-semibold tabular-nums ${(['Expired', 'Waste Pending'].includes(label) && value > 0) ? 'text-red-700' : 'text-[#18372e]'}`}>{value}</p><a href={`#${target}`} className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-[#174e3f]">{action}<ArrowRight size={13} /></a></article>)}
@@ -93,6 +93,5 @@ export default function PharmacistDashboard({ token, refreshKey, onNavigate }: {
 
       <section id="waste-overview" className={card}><div className="flex items-center gap-2"><Trash2 size={17} className="text-[#55704f]"/><h3 className="font-semibold">Waste Summary</h3>      <button type="button" onClick={() => onNavigate('Waste Management')} className={`${button} ml-auto`}>Manage waste</button></div><dl className="mt-4 grid grid-cols-3 gap-2">{stat('Disposal pending', data.waste_summary.disposal_pending)}{stat('Collected', data.waste_summary.collected)}{stat('Disposed', data.waste_summary.disposed)}</dl>{data.waste_summary.pending_items.length ? <ul className="mt-3 divide-y divide-[#edf0ea]">{data.waste_summary.pending_items.map((w, i) => <li key={`${w.created_at}-${i}`} className="py-2 text-sm">{w.medicine_name || 'Waste record'} · {w.quantity} units · disposal pending</li>)}</ul> : <p className="mt-3 text-sm text-[#718078]">No waste actions are pending.</p>}</section>
     </div>
-    <section id="notifications" className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#e4e9e0] bg-[#f7f8f5] p-4"><p className="text-sm"><Bell size={15} className="mr-2 inline"/>Unread notifications: <b>{s.unread_notifications}</b></p>    <button type="button" onClick={() => onNavigate('Notifications')} className={button}>View notifications</button></section>
   </div>
 }

@@ -1,7 +1,9 @@
 """Extract visible medicine package text; pharmacists remain responsible for verification."""
+import calendar
 import json
 import re
 from dataclasses import dataclass
+from datetime import date
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from typing import Protocol
@@ -38,6 +40,16 @@ GEMINI_RESPONSE_SCHEMA = {
 
 
 class ExtractionConfigurationError(RuntimeError):
+    pass
+
+
+class ExtractionProviderError(RuntimeError):
+    """A provider could not complete the request; the image may be readable."""
+    pass
+
+
+class UnreadableImageError(RuntimeError):
+    """The provider returned no usable structured information for the image."""
     pass
 
 
@@ -113,9 +125,9 @@ class GeminiExtractionProvider:
 
     def extract(self, image: bytes, content_type: str) -> ExtractionResult:
         if not self._api_key:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
+            raise ExtractionConfigurationError("Gemini extraction is not configured. Please contact support or continue with manual verification.")
         if not image or content_type not in {"image/jpeg", "image/png", "image/webp"}:
-            raise RuntimeError("Unsupported or empty image")
+            raise UnreadableImageError("The stored image is empty or has an unsupported format.")
 
         try:
             from google import genai
@@ -137,12 +149,18 @@ class GeminiExtractionProvider:
                     response_schema=GEMINI_RESPONSE_SCHEMA,
                 ),
             )
+        except Exception as exc:
+            raise ExtractionProviderError("AI extraction is temporarily unavailable. Please try again later or continue with manual verification.") from exc
+
+        try:
             response_text = response.text
             if not isinstance(response_text, str) or not response_text.strip():
-                raise ValueError("Empty structured response")
+                raise ExtractionProviderError("AI extraction returned an empty response. Please retry later or continue with manual verification.")
             fields = _parse_gemini_fields(response_text)
+        except ExtractionProviderError:
+            raise
         except Exception as exc:
-            raise RuntimeError("Gemini could not extract this image") from exc
+            raise ExtractionProviderError("AI extraction returned a response that could not be processed. Please retry later or continue with manual verification.") from exc
 
         fields["raw_ocr_text"] = None
         # Gemini does not expose calibrated OCR-character confidence scores.
@@ -167,6 +185,8 @@ def _parse_gemini_fields(response_text: str) -> dict:
         if field == "quantity":
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 fields[field] = value
+        elif field == "expiry_date" and isinstance(value, str):
+            fields[field] = normalize_expiry_date(value.strip())
         elif isinstance(value, str) and value.strip():
             fields[field] = value.strip()
     return fields
@@ -237,9 +257,16 @@ def _map_visible_fields(lines: list[tuple[str, float]]) -> tuple[dict, dict]:
         if batch and fields["batch_number"] is None:
             _put(fields, confidence, "batch_number", batch.group(1), score)
 
-        expiry = re.search(r"\bEXP(?:IRY|IRATION)?\.?\s*[:#.-]?\s*(\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2})\b", upper)
-        if expiry and fields["expiry_date"] is None and _valid_expiry_token(expiry.group(1)):
-            _put(fields, confidence, "expiry_date", expiry.group(1), score)
+        expiry = re.search(
+            r"\bEXP(?:IRY|IRATION)?\.?\s*[:#.-]?\s*"
+            r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}[/-]\d{1,2}|\d{1,2}[/-]\d{2,4})"
+            r"(?![\d/.-])",
+            upper,
+        )
+        if expiry and fields["expiry_date"] is None:
+            normalized_expiry = normalize_expiry_date(expiry.group(1))
+            if normalized_expiry is not None:
+                _put(fields, confidence, "expiry_date", normalized_expiry, score)
 
         quantity = re.search(r"\b(\d{1,4})\s*(?:TABLETS?|TABS?|CAPSULES?|CAPS?|SACHETS?|AMPOULES?|VIALS?|ML)\b", upper)
         if quantity and fields["quantity"] is None:
@@ -296,15 +323,32 @@ def _map_visible_fields(lines: list[tuple[str, float]]) -> tuple[dict, dict]:
     return fields, confidence
 
 
-def _valid_expiry_token(value: str) -> bool:
-    parts = re.split(r"[/-]", value)
+def normalize_expiry_date(value: str) -> str | None:
+    """Normalize supported package dates to ISO dates; month-only labels expire at month end."""
+    value = value.strip()
     try:
-        first, second = int(parts[0]), int(parts[1])
-    except (IndexError, ValueError):
-        return False
-    if len(parts[0]) == 4:
-        return first >= 2000 and 1 <= second <= 12
-    return 1 <= first <= 12 and (0 <= second <= 99 or 2000 <= second <= 2100)
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            year, month, day = map(int, value.split("-"))
+            return date(year, month, day).isoformat()
+        year_month = re.fullmatch(r"(\d{4})[/-](\d{1,2})", value)
+        if year_month:
+            year, month = map(int, year_month.groups())
+            final_day = calendar.monthrange(year, month)[1]
+            return date(year, month, final_day).isoformat()
+        full_date = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", value)
+        if full_date:
+            day, month, year = map(int, full_date.groups())
+            return date(year, month, day).isoformat()
+        month_year = re.fullmatch(r"(\d{1,2})[/-](\d{2}|\d{4})", value)
+        if not month_year:
+            return None
+        month, year = map(int, month_year.groups())
+        if len(month_year.group(2)) == 2:
+            year += 2000
+        final_day = calendar.monthrange(year, month)[1]
+        return date(year, month, final_day).isoformat()
+    except (ValueError, OverflowError):
+        return None
 
 
 def get_extraction_provider() -> MedicineExtractionProvider:

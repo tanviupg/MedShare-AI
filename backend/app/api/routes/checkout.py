@@ -10,7 +10,7 @@ from app.api.dependencies import require_role
 from app.db.database import get_db
 from app.models import Checkout, ClinicProfile, Inventory, InventoryStatus, MedicineRequest, MedicineRequestStatus, PaymentStatus, Prescription, PrescriptionStatus, User, UserRole
 from app.schemas.checkout import CheckoutResponse
-from app.services.business_time import business_today
+from app.services.expiry import expiry_is_eligible, synchronize_expired_reservations
 
 router = APIRouter(prefix="/patient/checkout", tags=["simulated checkout"])
 
@@ -27,8 +27,8 @@ def _owned_approved_request(db: Session, request_id: UUID, patient: User, lock: 
     inventory = db.scalar(select(Inventory).where(Inventory.id == request.inventory_id).with_for_update() if lock else select(Inventory).where(Inventory.id == request.inventory_id))
     if inventory is None:
         raise HTTPException(status_code=409, detail="Reserved medicine is unavailable")
-    if inventory.expiry_date < business_today() or inventory.status == InventoryStatus.EXPIRED:
-        raise HTTPException(status_code=409, detail="Expired medicine cannot proceed to checkout")
+    if not expiry_is_eligible(inventory.expiry_date) or inventory.status == InventoryStatus.EXPIRED:
+        raise HTTPException(status_code=409, detail="Medicine no longer meets the minimum remaining shelf-life requirement")
     if inventory.prescription_required is None:
         raise HTTPException(status_code=409, detail="Prescription requirement is not classified")
     if inventory.prescription_required:
@@ -69,6 +69,7 @@ def _get_or_create(db: Session, request: MedicineRequest, patient: User) -> Chec
 
 @router.get("/{request_id}", response_model=CheckoutResponse)
 def get_checkout(request_id: UUID, db: Session = Depends(get_db), patient: User = Depends(require_role(UserRole.PATIENT))):
+    synchronize_expired_reservations(db, patient_id=patient.id, request_id=request_id)
     request, inventory = _owned_approved_request(db, request_id, patient, lock=True)
     row = _get_or_create(db, request, patient)
     db.commit()
@@ -78,6 +79,7 @@ def get_checkout(request_id: UUID, db: Session = Depends(get_db), patient: User 
 
 @router.post("/{request_id}/demo-pay", response_model=CheckoutResponse)
 def complete_demo_payment(request_id: UUID, db: Session = Depends(get_db), patient: User = Depends(require_role(UserRole.PATIENT))):
+    synchronize_expired_reservations(db, patient_id=patient.id, request_id=request_id)
     request, inventory = _owned_approved_request(db, request_id, patient, lock=True)
     row = _get_or_create(db, request, patient)
     if row.payment_status == PaymentStatus.PAID:

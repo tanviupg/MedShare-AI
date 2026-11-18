@@ -283,7 +283,7 @@ export default function PharmacistExpiryWaste({ token }: { token: string }) {
         {startForm(item) ? <WasteEntryForm draft={wasteDraft!} busy={busy} fieldError={fieldError} onChange={setWasteDraft} onCancel={() => { setWasteDraft(null); setFieldError('') }} onSubmit={submitWaste} />
           : item.quantity_verified && (item.quantity ?? 0) > 0 && item.medicine_name && item.unit && item.expiry_date
             ? <button type="button" disabled={busy} onClick={() => beginWasteEntry(item, 'donation')} className={actionClass}>Record for Disposal</button>
-            : <p className="text-sm text-amber-800">{item.expiry_date && new Date(`${item.expiry_date}T00:00:00`) < new Date(new Date().toDateString()) ? 'Expired medicine: verify details, then record for disposal.' : 'Verify the medicine details and actual quantity to continue.'}</p>}
+            : <p className="text-sm text-amber-800">{item.days_remaining !== undefined && item.days_remaining < 0 ? 'Expired medicine: verify details, then record for disposal.' : 'Verify the medicine details and actual quantity to continue.'}</p>}
         </>}
       </div>}
       {(tab === 'waste' || tab === 'disposal') && item.status === 'DISPOSAL_PENDING' && <div className="mt-3">

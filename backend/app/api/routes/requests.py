@@ -13,6 +13,7 @@ from app.schemas.medicine_request import MedicineRequestCreate, MedicineRequestD
 from app.models import NotificationType
 from app.services.notifications import notify
 from app.services.business_time import business_today
+from app.services.expiry import expiry_is_eligible, synchronize_expired_reservations
 
 patient_router = APIRouter(prefix="/patient/requests", tags=["patient requests"])
 pharmacist_router = APIRouter(prefix="/pharmacist/requests", tags=["pharmacist requests"])
@@ -61,7 +62,7 @@ def _new_request(body: MedicineRequestCreate, db: Session, patient: User, requir
     profile = db.scalar(select(ClinicProfile).where(ClinicProfile.user_id == inventory.pharmacist_id))
     pharmacist = db.get(User, inventory.pharmacist_id)
     if (donation is None or donation.status != DonationStatus.APPROVED
-        or inventory.status != InventoryStatus.AVAILABLE or inventory.quantity_available <= 0 or inventory.expiry_date < business_today()
+        or inventory.status != InventoryStatus.AVAILABLE or inventory.quantity_available <= 0 or not expiry_is_eligible(inventory.expiry_date)
         or pharmacist is None or not pharmacist.is_active or profile is None or profile.verification_status != ClinicVerificationStatus.VERIFIED):
         raise HTTPException(status_code=409, detail="This medicine is no longer available")
     if body.requested_quantity > inventory.quantity_available:
@@ -99,12 +100,14 @@ def create_request(body: MedicineRequestCreate, db: Session = Depends(get_db), p
 
 @patient_router.get("", response_model=list[MedicineRequestPatientResponse])
 def list_patient_requests(db: Session = Depends(get_db), patient: User = Depends(require_role(UserRole.PATIENT))):
+    synchronize_expired_reservations(db, patient_id=patient.id)
     requests = db.scalars(select(MedicineRequest).where(MedicineRequest.patient_id == patient.id).order_by(MedicineRequest.created_at.desc())).all()
     return [_patient_payload(db, row) for row in requests]
 
 
 @patient_router.get("/{request_id}", response_model=MedicineRequestPatientResponse)
 def get_patient_request(request_id: UUID, db: Session = Depends(get_db), patient: User = Depends(require_role(UserRole.PATIENT))):
+    synchronize_expired_reservations(db, patient_id=patient.id, request_id=request_id)
     row = db.scalar(select(MedicineRequest).where(MedicineRequest.id == request_id, MedicineRequest.patient_id == patient.id))
     if row is None:
         raise HTTPException(status_code=404, detail="Medicine request not found")
@@ -113,6 +116,7 @@ def get_patient_request(request_id: UUID, db: Session = Depends(get_db), patient
 
 @patient_router.post("/{request_id}/cancel", response_model=MedicineRequestPatientResponse)
 def cancel_patient_request(request_id: UUID, db: Session = Depends(get_db), patient: User = Depends(require_role(UserRole.PATIENT))):
+    synchronize_expired_reservations(db, patient_id=patient.id, request_id=request_id)
     row = db.scalar(select(MedicineRequest).where(
         MedicineRequest.id == request_id, MedicineRequest.patient_id == patient.id
     ).with_for_update())
@@ -137,27 +141,30 @@ def cancel_patient_request(request_id: UUID, db: Session = Depends(get_db), pati
 @pharmacist_router.get("", response_model=list[MedicineRequestPharmacistResponse])
 def list_pharmacist_requests(db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
     _require_verified_clinic(db, pharmacist)
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id)
     rows = db.scalars(select(MedicineRequest).join(Inventory, Inventory.id == MedicineRequest.inventory_id).where(Inventory.pharmacist_id == pharmacist.id).order_by(MedicineRequest.status, MedicineRequest.created_at)).all()
     return [_pharmacist_payload(db, row) for row in rows]
 
 
 @pharmacist_router.get("/{request_id}", response_model=MedicineRequestPharmacistResponse)
 def get_pharmacist_request(request_id: UUID, db: Session = Depends(get_db), pharmacist: User = Depends(require_role(UserRole.CLINIC_PHARMACIST))):
+    _require_verified_clinic(db, pharmacist)
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id, request_id=request_id)
     row = db.scalar(select(MedicineRequest).join(Inventory, Inventory.id == MedicineRequest.inventory_id).where(MedicineRequest.id == request_id, Inventory.pharmacist_id == pharmacist.id))
     if row is None:
         raise HTTPException(status_code=404, detail="Medicine request not found")
-    _require_verified_clinic(db, pharmacist)
     return _pharmacist_payload(db, row)
 
 
 def _review(request_id: UUID, db: Session, pharmacist: User, decision: MedicineRequestStatus, reason: str | None):
+    _require_verified_clinic(db, pharmacist)
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist.id, request_id=request_id)
     row = db.scalar(select(MedicineRequest).where(MedicineRequest.id == request_id).with_for_update())
     if row is None:
         raise HTTPException(status_code=404, detail="Medicine request not found")
     inventory = db.scalar(select(Inventory).where(Inventory.id == row.inventory_id).with_for_update())
     if inventory is None or inventory.pharmacist_id != pharmacist.id:
         raise HTTPException(status_code=404, detail="Medicine request not found")
-    _require_verified_clinic(db, pharmacist)
     if row.status != MedicineRequestStatus.PENDING:
         raise HTTPException(status_code=409, detail="Only pending requests can be reviewed")
     if decision == MedicineRequestStatus.APPROVED:
@@ -167,8 +174,8 @@ def _review(request_id: UUID, db: Session, pharmacist: User, decision: MedicineR
             latest = db.scalar(select(Prescription).where(Prescription.request_id == row.id).order_by(Prescription.created_at.desc(), Prescription.id.desc()).limit(1).with_for_update())
             if latest is None or latest.status != PrescriptionStatus.APPROVED:
                 raise HTTPException(status_code=409, detail="An approved prescription is required before this request can be approved")
-        if inventory.expiry_date < business_today():
-            raise HTTPException(status_code=409, detail="Expired inventory cannot be approved")
+        if not expiry_is_eligible(inventory.expiry_date):
+            raise HTTPException(status_code=409, detail="Inventory no longer meets the minimum remaining shelf-life requirement")
         if row.inventory_reserved:
             if inventory.status not in (InventoryStatus.AVAILABLE, InventoryStatus.DEPLETED):
                 raise HTTPException(status_code=409, detail="This inventory is no longer available")

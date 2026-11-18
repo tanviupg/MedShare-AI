@@ -11,20 +11,18 @@ from app.models import ClinicProfile, ClinicVerificationStatus, Donation, Donati
 from app.schemas.inventory import InventoryResponse, InventoryPricingUpdate, InventoryQuantityUpdate, PrescriptionRequirementUpdate
 from app.services.pricing import calculate_patient_price
 from app.services.business_time import business_today
+from app.services.expiry import (
+    expiry_warning_days,
+    minimum_eligible_expiry_date,
+    synchronize_expired_reservations,
+)
+from app.core.config import get_settings
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
 
 
 def expire_old_inventory(db: Session, pharmacist_id: UUID) -> None:
-    today = business_today()
-    rows = db.scalars(select(Inventory).where(
-        Inventory.pharmacist_id == pharmacist_id,
-        Inventory.expiry_date < today,
-        Inventory.status.in_([InventoryStatus.AVAILABLE, InventoryStatus.RESERVED]),
-    ).with_for_update()).all()
-    for item in rows:
-        item.status = InventoryStatus.EXPIRED
-    db.commit()
+    synchronize_expired_reservations(db, pharmacist_id=pharmacist_id)
 
 
 def inventory_response(item: Inventory, db: Session) -> InventoryResponse:
@@ -37,6 +35,9 @@ def inventory_response(item: Inventory, db: Session) -> InventoryResponse:
     )) or 0
     return InventoryResponse.model_validate({
         **{column.name: getattr(item, column.name) for column in Inventory.__table__.columns},
+        "days_remaining": (item.expiry_date - business_today()).days,
+        "expiry_warning_days": expiry_warning_days(),
+        "minimum_remaining_shelf_life_days": get_settings().minimum_remaining_shelf_life_days,
         "reserved_quantity": reserved_quantity,
         "source_donation": {"id": donation.id, "donor_id": donation.donor_id, "status": donation.status, "created_at": donation.created_at},
         "review": {"decision": review.decision, "reason": review.reason, "reviewed_at": review.reviewed_at, "pharmacist_id": review.pharmacist_id},
@@ -104,8 +105,8 @@ def set_inventory_quantity(inventory_id: UUID, body: InventoryQuantityUpdate, db
         raise HTTPException(status_code=404, detail="Inventory record not found")
     if body.quantity_available > item.original_quantity:
         raise HTTPException(status_code=422, detail="Available quantity cannot exceed the original donated quantity")
-    if item.expiry_date < business_today() and body.quantity_available > 0:
-        raise HTTPException(status_code=409, detail="Expired inventory quantity cannot be made available")
+    if item.expiry_date < minimum_eligible_expiry_date() and body.quantity_available > 0:
+        raise HTTPException(status_code=409, detail="Inventory below the minimum remaining shelf-life cannot be made available")
     reserved = db.scalar(select(func.coalesce(func.sum(MedicineRequest.requested_quantity), 0)).where(
         MedicineRequest.inventory_id == item.id,
         MedicineRequest.inventory_reserved.is_(True),

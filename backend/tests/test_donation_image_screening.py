@@ -19,9 +19,18 @@ class FakeClassifier:
         return self.result
 
 
+class FakeExtractor:
+    def __init__(self, medicine_name):
+        self.result = SimpleNamespace(fields={"medicine_name": medicine_name})
+
+    def extract(self, content, content_type):
+        return self.result
+
+
 class DonationImageScreeningTests(unittest.TestCase):
     def setUp(self):
         self.settings = SimpleNamespace(
+            prescription_image_classifier_enabled=True,
             prescription_image_classifier_min_confidence=0.75,
             prescription_image_classifier_min_margin=0.20,
         )
@@ -33,13 +42,36 @@ class DonationImageScreeningTests(unittest.TestCase):
         self.addCleanup(self.settings_patch.stop)
 
     def test_confident_medicine_packaging_is_accepted(self):
-        screen_medicine_photo(b"image", FakeClassifier("medicine_packaging", 0.92, 0.61))
+        with patch("app.services.medicine_extraction.get_extraction_provider", return_value=FakeExtractor("AMOXICILLIN")):
+            screen_medicine_photo(b"image", FakeClassifier("medicine_packaging", 0.92, 0.61))
 
     def test_confident_unrelated_photo_is_rejected_with_specific_message(self):
         with self.assertRaises(HTTPException) as raised:
             screen_medicine_photo(b"dog photo", FakeClassifier("unrelated", 0.97, 0.91))
         self.assertEqual(raised.exception.status_code, 415)
         self.assertEqual(raised.exception.detail, UNRELATED_IMAGE_MESSAGE)
+
+    def test_dog_and_sticker_images_remain_rejected(self):
+        for label in ("dog", "sticker"):
+            classifier = FakeClassifier("unrelated", 0.97, 0.91)
+            with self.subTest(label=label), self.assertRaises(HTTPException) as raised:
+                screen_medicine_photo(label.encode(), classifier)
+            self.assertEqual(raised.exception.status_code, 415)
+            self.assertEqual(raised.exception.detail, UNRELATED_IMAGE_MESSAGE)
+
+    def test_blister_packaging_without_readable_medicine_name_is_rejected(self):
+        with patch("app.services.medicine_extraction.get_extraction_provider", return_value=FakeExtractor(None)), self.assertRaises(HTTPException) as raised:
+            screen_medicine_photo(b"blank blister", FakeClassifier("medicine_packaging", 0.92, 0.61))
+        self.assertEqual(raised.exception.status_code, 415)
+        self.assertEqual(raised.exception.detail, AMBIGUOUS_IMAGE_MESSAGE)
+
+    def test_extraction_failure_fails_closed(self):
+        class BrokenExtractor:
+            def extract(self, content, content_type):
+                raise RuntimeError("OCR unavailable")
+
+        with patch("app.services.medicine_extraction.get_extraction_provider", return_value=BrokenExtractor()), self.assertRaises(HTTPException):
+            screen_medicine_photo(b"image", FakeClassifier("medicine_packaging", 0.92, 0.61))
 
     def test_ambiguous_or_unrecognized_photo_requires_clearer_packaging(self):
         results = (
@@ -48,10 +80,11 @@ class DonationImageScreeningTests(unittest.TestCase):
             FakeClassifier("unrelated", 0.68, 0.11),
         )
         for classifier in results:
-            with self.subTest(label=classifier.result.label), self.assertRaises(HTTPException) as raised:
-                screen_medicine_photo(b"image", classifier)
-            self.assertEqual(raised.exception.status_code, 415)
-            self.assertEqual(raised.exception.detail, AMBIGUOUS_IMAGE_MESSAGE)
+            with self.subTest(label=classifier.result.label):
+                with self.assertRaises(HTTPException) as raised:
+                    screen_medicine_photo(b"image", classifier)
+                self.assertEqual(raised.exception.status_code, 415)
+                self.assertEqual(raised.exception.detail, AMBIGUOUS_IMAGE_MESSAGE)
 
     def test_unavailable_classifier_fails_closed_without_storing(self):
         with patch(
