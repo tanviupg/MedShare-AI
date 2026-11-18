@@ -42,5 +42,3 @@ Open `http://localhost:5173`.
 
 The JWT secret is saved in `.env`; do not regenerate it every time.
 
-reviewer@example.com
-FrogGoesMooo7

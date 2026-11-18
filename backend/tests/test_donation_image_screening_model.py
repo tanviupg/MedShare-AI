@@ -2,6 +2,7 @@ import importlib.util
 from io import BytesIO
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 from PIL import Image, ImageDraw
@@ -22,6 +23,11 @@ MODEL_AVAILABLE = (
     and importlib.util.find_spec("torch") is not None
     and importlib.util.find_spec("transformers") is not None
 )
+
+
+class ReadableMedicineExtractor:
+    def extract(self, content, content_type):
+        return SimpleNamespace(fields={"medicine_name": "AMOXICILLIN"})
 
 
 @unittest.skipUnless(MODEL_AVAILABLE, "Local CLIP weights or optional inference dependencies are unavailable")
@@ -48,7 +54,7 @@ class LocalDonationImageModelTests(unittest.TestCase):
             with self.subTest(image_format=image_format):
                 output = BytesIO()
                 image.save(output, format=image_format)
-                screen_medicine_photo(output.getvalue(), self.classifier)
+                screen_medicine_photo(output.getvalue(), self.classifier, ReadableMedicineExtractor(), f"image/{image_format.lower()}")
 
     def test_clear_local_dog_jpeg_is_rejected_when_fixture_is_available(self):
         dog_content = None
@@ -74,7 +80,7 @@ class LocalDonationImageModelTests(unittest.TestCase):
             content = path.read_bytes()
             result = self.classifier.classify_medicine_photo(content)
             if result.label == "medicine_packaging" and result.confidence >= 0.75 and result.margin >= 0.20:
-                screen_medicine_photo(content, self.classifier)
+                screen_medicine_photo(content, self.classifier, ReadableMedicineExtractor(), "image/webp")
                 return
         self.skipTest("No local real WebP medicine-packaging fixture is available")
 

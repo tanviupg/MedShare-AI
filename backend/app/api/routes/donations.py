@@ -296,7 +296,7 @@ async def add_donation_images(donation_id: UUID, files: list[UploadFile] = File(
                 raise HTTPException(status_code=415, detail="The file is empty or is not a complete, decodable JPEG, PNG, or WebP image")
             if content_type not in ALLOWED_IMAGE_TYPES or content_type != IMAGE_CONTENT_TYPES.get(kind):
                 raise HTTPException(status_code=415, detail="Only JPEG, PNG, and WebP images are accepted")
-            screen_medicine_photo(content)
+            screen_medicine_photo(content, content_type=content_type)
             digest = hashlib.sha256(content).digest()
             duplicate = next((image for image in donation.images if hashlib.sha256(storage.read(image.storage_key)).digest() == digest), None)
             if duplicate is not None:

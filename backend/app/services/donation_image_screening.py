@@ -16,18 +16,11 @@ AMBIGUOUS_IMAGE_MESSAGE = (
 )
 
 
-def screen_medicine_photo(content: bytes, classifier=None) -> None:
+def screen_medicine_photo(content: bytes, classifier=None, extractor=None, content_type="image/jpeg") -> None:
     """Require a confident local content classification before storing a donor photo."""
     settings = get_settings()
 
-    if not settings.prescription_image_classifier_enabled:
-        logger.warning(
-            "Medicine photo screening is disabled; "
-            "accepting upload without image classification."
-       )
-        return
-
-    if classifier is None:
+    if settings.prescription_image_classifier_enabled and classifier is None:
         try:
             from app.services.prescription_image_classifier import get_prescription_image_classifier
 
@@ -41,41 +34,62 @@ def screen_medicine_photo(content: bytes, classifier=None) -> None:
                 detail="Medicine photo screening is unavailable. The upload was not stored; please try again later.",
             ) from exc
 
+    if settings.prescription_image_classifier_enabled:
+        try:
+            result = classifier.classify_medicine_photo(content)
+        except Exception as exc:
+            logger.exception("Donation image classifier inference failed")
+            raise HTTPException(
+                status_code=503,
+                detail="Medicine photo screening failed. The upload was not stored; please try again later.",
+            ) from exc
+
+        confidence_threshold = settings.prescription_image_classifier_min_confidence
+        margin_threshold = settings.prescription_image_classifier_min_margin
+        confidently_unrelated = (
+            result.label == "unrelated"
+            and result.confidence >= confidence_threshold
+            and result.margin >= margin_threshold
+        )
+        if confidently_unrelated:
+            logger.info(
+                "Donation image rejected by content screening (label=%s, confidence=%.4f, margin=%.4f)",
+                result.label,
+                result.confidence,
+                result.margin,
+            )
+            raise HTTPException(status_code=415, detail=UNRELATED_IMAGE_MESSAGE)
+
+        confidently_packaged = (
+            result.label == "medicine_packaging"
+            and result.confidence >= confidence_threshold
+            and result.margin >= margin_threshold
+        )
+        if not confidently_packaged:
+            logger.info(
+                "Donation image requires clearer content (label=%s, confidence=%.4f, margin=%.4f)",
+                result.label,
+                result.confidence,
+                result.margin,
+            )
+            raise HTTPException(status_code=415, detail=AMBIGUOUS_IMAGE_MESSAGE)
+
+    # Packaging alone does not identify a medicine. Reuse the existing extraction
+    # provider; PaddleOCR only emits medicine_name at its established 0.85 threshold.
+    if extractor is None:
+        try:
+            from app.services.medicine_extraction import get_extraction_provider
+
+            extractor = get_extraction_provider()
+        except Exception as exc:
+            logger.exception("Donation medicine identification provider initialization failed")
+            raise HTTPException(status_code=503, detail=AMBIGUOUS_IMAGE_MESSAGE) from exc
     try:
-        result = classifier.classify_medicine_photo(content)
+        extracted = extractor.extract(content, content_type)
+        medicine_name = (extracted.fields or {}).get("medicine_name")
     except Exception as exc:
-        logger.exception("Donation image classifier inference failed")
-        raise HTTPException(
-            status_code=503,
-            detail="Medicine photo screening failed. The upload was not stored; please try again later.",
-        ) from exc
-
-    confidence_threshold = settings.prescription_image_classifier_min_confidence
-    margin_threshold = settings.prescription_image_classifier_min_margin
-    confidently_unrelated = (
-        result.label == "unrelated"
-        and result.confidence >= confidence_threshold
-        and result.margin >= margin_threshold
-    )
-    if confidently_unrelated:
-        logger.info(
-            "Donation image rejected by content screening (label=%s, confidence=%.4f, margin=%.4f)",
-            result.label,
-            result.confidence,
-            result.margin,
-        )
-        raise HTTPException(status_code=415, detail=UNRELATED_IMAGE_MESSAGE)
-
-    confidently_packaged = (
-        result.label == "medicine_packaging"
-        and result.confidence >= confidence_threshold
-        and result.margin >= margin_threshold
-    )
-    if not confidently_packaged:
-        logger.info(
-            "Donation image requires clearer content (label=%s, confidence=%.4f, margin=%.4f)",
-            result.label,
-            result.confidence,
-            result.margin,
-        )
+        logger.exception("Donation medicine identification failed")
+        raise HTTPException(status_code=415, detail=AMBIGUOUS_IMAGE_MESSAGE) from exc
+    if not isinstance(medicine_name, str) or not medicine_name.strip():
+        logger.info("Donation image rejected because no medicine name was readable")
         raise HTTPException(status_code=415, detail=AMBIGUOUS_IMAGE_MESSAGE)
